@@ -1,0 +1,45 @@
+# Reference docker-compose for deploying a Worker Agent at a partner school.
+#
+# Preferred entry point: `./setup.sh` (writes .env + brings the container up).
+# Manual path: copy .env.example → .env, edit, then `docker compose up -d`.
+#
+# For Isaac Sim / real evaluation, uncomment the GPU runtime block and add
+# the aicapstone/private_tasks bind mounts (see central worker.Dockerfile
+# for the full list).
+
+services:
+  worker-agent:
+    build: .
+    container_name: worker-agent
+    restart: unless-stopped
+    ports:
+      # WORKER_HOST_PORT is written by setup.sh (default 8081); if you're
+      # sharing a host with the central dev backend that also binds 8080,
+      # keep it at 8081.
+      - "${WORKER_HOST_PORT:-8081}:8080"
+    env_file: .env
+    # Needed so the worker container can reach the central backend at
+    # http://host.docker.internal:8001 (dev-machine setup). In a real
+    # multi-host deploy you'd point CENTRAL_API_URL at a public hostname
+    # and this extra_hosts line is unnecessary.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - worker_storage:/var/lib/worker-agent/storage
+      - worker_state:/var/lib/worker-agent/state
+      # Isaac Sim mode:
+      # - ../aicapstone:/aicapstone:ro
+      # - ../private_tasks:/private_tasks:ro
+    # runtime: nvidia    # uncomment for GPU rollout
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: ${GPU_ID:-all}
+    #   NVIDIA_DRIVER_CAPABILITIES: graphics,display,utility,compute
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  worker_storage:
+  worker_state:
