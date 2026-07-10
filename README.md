@@ -21,7 +21,7 @@ Prereqs on the GPU host: Docker Engine 20.10+, docker compose plugin, curl.
 For `EVAL_MODE=real`: NVIDIA driver + `nvidia-container-toolkit`.
 
 ```bash
-git clone https://github.com/asddzxcc1856/aicapstone-worker.git
+git clone https://github.com/HCIS-Lab/aicapstone-worker.git
 cd aicapstone-worker
 ./setup.sh                # interactive — asks for join token + public URL
 ```
