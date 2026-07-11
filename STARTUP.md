@@ -24,8 +24,13 @@
 | nvidia-container-toolkit | 只有 `EVAL_MODE=real` 才需要 |
 | 對外可達 URL | 給學生瀏覽器 upload 用；HTTPS 反向代理到 worker 的 host port |
 | 對外埠 | 預設 8081 起跳，一個 worker 佔一個 port |
+| 磁碟 | 每個 worker 至少 30 GB — Isaac Sim 的 Omniverse 資產 cache (`/root/.cache/ov`) 會長到 10-20 GB，加上學生 zip + 錄影 |
 
 檢查腳本會在 `./setup.sh` 開頭跑一次，缺什麼會直接告訴你。
+
+**Isaac Sim 資產 cache**：worker container 掛了一個 docker volume
+`worker_ov_cache` 到 `/root/.cache/ov`。第一次跑 real 模式時 Isaac Sim
+會從 S3 拉多 GB 的 USD 資產，之後這些資產都會存在這個 volume 裡；container 重啟不會清掉。**只有** `docker compose down -v` 才會把它一起清掉，之後下次 real 評估又要從頭下載一次（在較慢的網路上可能會失敗）。所以請不要沒事就 `-v`。
 
 ---
 
@@ -121,9 +126,17 @@ already exhausted`) — token 只能被 redeem `max_uses` 次。
 docker compose logs -f           # 即時 log
 docker compose restart           # 重啟 (改設定後用)
 docker compose down              # 停掉 (不會刪 volume)
-docker compose down -v           # 停掉 + 刪 storage/state volume (重灌用)
+docker compose down -v           # 停掉 + 刪 storage/state/Isaac Sim cache
+                                 # 三個 volume — 下次 real 評估要重下多 GB 資產
 ./setup.sh --reset --yes         # = 上面 + 重跑 setup 從零註冊
 ```
+
+三個 docker volume：
+| Volume | 用途 | 清了之後會怎樣 |
+|---|---|---|
+| `worker_storage` | 學生 zip、staged workdir、錄影 | 進行中的 eval 檔案沒了；已回報的分數不影響 (中央存 DB) |
+| `worker_state` | machine JWT、worker id | 得重跑 `setup.sh --reset` 用新 join token 重新註冊 |
+| `worker_ov_cache` | Isaac Sim 從 S3 抓下來的 USD 資產 | 下次跑 real 模式要花時間 (甚至 30+ min) 重下 |
 
 **改設定的正確流程**：
 1. 直接改 clone 目錄下的 `.env`

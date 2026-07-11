@@ -31,6 +31,13 @@ services:
     volumes:
       - worker_storage:/var/lib/worker-agent/storage
       - worker_state:/var/lib/worker-agent/state
+      # Omniverse asset cache — Isaac Sim writes here whenever it
+      # resolves a USD from S3. Multi-GB and slow to warm; this volume
+      # keeps it across container recreations so re-runs start in
+      # seconds instead of minutes. Safe to mount even in mock mode
+      # (nothing writes to it). Under `docker compose down -v` this
+      # volume is wiped, forcing the next real eval to re-download.
+      - worker_ov_cache:/root/.cache/ov
       # Isaac Sim mode:
       # - ../aicapstone:/aicapstone:ro
       # - ../private_tasks:/private_tasks:ro
@@ -47,3 +54,5 @@ services:
 volumes:
   worker_storage:
   worker_state:
+  # Persistent Omniverse asset cache (see mount comment above).
+  worker_ov_cache:
