@@ -15,6 +15,8 @@ communicates with the central control plane over HTTP.
 The central platform never sees the student's zip bytes when this agent
 is deployed — data locality is enforced by design.
 
+> **中文版學校端啟動流程 (SCHOOL_ADMIN 主要看這份)** → [STARTUP.md](./STARTUP.md)
+
 ## Quick start (one command)
 
 Prereqs on the GPU host: Docker Engine 20.10+, docker compose plugin, curl.
@@ -57,6 +59,48 @@ Reset (wipe cached machine JWT + reconfigure):
 ```bash
 ./setup.sh --reset
 ```
+
+## Multiple workers on the same host
+
+You can run any number of workers on one machine — each gets its own
+GPU, host port, and container name. The central plane doesn't need to
+know how you split them; workers pull work themselves.
+
+**How the assignment actually works (no per-school dispatcher needed):**
+
+1. Students submit at central → central persists the row with
+   `status=QUEUED` and tags it with the student's `school_id`.
+2. Every online worker for that school long-polls
+   `POST /api/workers/next-job`. Whichever worker asks first while free
+   gets the oldest QUEUED submission — pure pull architecture, no push
+   from central and no coordinator inside the school.
+3. Central issues a presigned URL to the student's browser of the form
+   `{WORKER_PUBLIC_URL}/upload/{token}` so the zip goes **directly** to
+   the worker that will run it — the bytes never traverse central.
+
+The one thing you must give each worker is its **own reachable URL**.
+Two workers can't share a port, so `setup.sh` will:
+
+- **Auto-pick a free host port** in `8081..8181`
+- **Adjust `WORKER_PUBLIC_URL`** if the guess was `:8081` but a later port was picked
+- **Name each container** `worker-agent-<port>` so a second `docker compose up`
+  on the same host doesn't error with "name is already in use"
+
+Practical layout for a two-GPU host:
+
+```bash
+# First worker
+git clone https://github.com/HCIS-Lab/aicapstone-worker.git worker-gpu0
+cd worker-gpu0 && ./setup.sh          # picks GPU 0, port 8081
+cd ..
+
+# Second worker (separate clone → separate .env / state volume)
+git clone https://github.com/HCIS-Lab/aicapstone-worker.git worker-gpu1
+cd worker-gpu1 && ./setup.sh          # picks GPU 1, port 8082
+```
+
+Both workers register under the same `SCHOOL_ADMIN` join token and show
+up as separate rows in the **Observability** tab.
 
 ### Getting a join token
 

@@ -7,10 +7,15 @@
 #   ./setup.sh --token=<JOIN_TOKEN> \       # non-interactive
 #              --public-url=https://gpu-01.school.edu.tw \
 #              --name=gpu-01 \
-#              --mode=mock \
+#              --mode=real \
+#              --gpu-id=1 \                 # optional; auto-selected if omitted
 #              --yes
 #   ./setup.sh --reset                      # wipe state + prompt again
 #   ./setup.sh --status                     # show current status
+#
+# GPU selection: in real mode we scan the host's nvidia-smi + other
+# worker-agent containers and pick the lowest-numbered card that isn't
+# already claimed. Pass --gpu-id=N to override.
 #
 # What it does:
 #   1. Verifies docker + docker compose (+ nvidia if EVAL_MODE=real)
@@ -52,10 +57,11 @@ for arg in "$@"; do
     --name=*)        CLI_NAME="${arg#*=}" ;;
     --mode=*)        CLI_MODE="${arg#*=}" ;;
     --central=*)     CLI_CENTRAL="${arg#*=}" ;;
+    --gpu-id=*)      : ;;  # consumed later so `pick_next_gpu` can still auto-detect
     --yes|-y)        YES=1 ;;
     --reset)         RESET=1 ;;
     --status)        STATUS_ONLY=1 ;;
-    --help|-h)       sed -n '2,20p' "$0"; exit 0 ;;
+    --help|-h)       sed -n '2,25p' "$0"; exit 0 ;;
     *) die "Unknown flag: $arg (use --help)";;
   esac
 done
@@ -69,7 +75,7 @@ if (( STATUS_ONLY )); then
   docker compose logs --tail=20 worker-agent 2>/dev/null || true
   echo
   local_port="$(grep -E '^WORKER_HOST_PORT=' .env 2>/dev/null | cut -d= -f2 || echo 8081)"
-  say "${DIM}Local /health:${RST}"
+  say "${DIM}Local /health (port ${local_port:-8081}):${RST}"
   curl -sf "http://localhost:${local_port:-8081}/health" || warn "no /health response"
   exit 0
 fi
@@ -168,6 +174,73 @@ case "$MODE" in
   *) die "EVAL_MODE must be 'mock' or 'real' (got '${MODE}')";;
 esac
 
+# ── GPU auto-selection ───────────────────────────────────────────────
+# Every worker container claims exactly one GPU. When the operator spins
+# up a SECOND worker on the same host we should hand it a different card
+# automatically so they don't fight over GPU 0.
+#
+# Strategy:
+#   1. If --gpu-id was passed OR .env already has a value, honor it.
+#   2. Else list local GPUs via nvidia-smi.
+#   3. Subtract the GPUs already claimed by other running worker
+#      containers on this host (via `docker ps` + the container env).
+#   4. Also subtract GPUs currently running non-worker processes with
+#      > 100 MB VRAM (typical Isaac Sim / training runs) so we don't
+#      collide with an existing job.
+#   5. Pick the lowest-numbered survivor; error out if none.
+#   6. In mock mode we skip everything above — no GPU needed.
+GPU_ID="$(env_get GPU_ID)"
+CLI_GPU_ID=""
+for arg in "$@"; do case "$arg" in --gpu-id=*) CLI_GPU_ID="${arg#*=}" ;; esac; done
+if [[ -n "$CLI_GPU_ID" ]]; then GPU_ID="$CLI_GPU_ID"; fi
+
+pick_next_gpu() {
+  # → prints the chosen id on stdout, empty if none available
+  local all_gpus busy_gpus claimed_by_containers occupied candidate
+  all_gpus="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ')"
+  [[ -z "$all_gpus" ]] && { echo ""; return 0; }
+
+  # GPUs with active compute contexts (any process, > 100 MB used mem).
+  busy_gpus="$(nvidia-smi --query-compute-apps=gpu_uuid,used_memory --format=csv,noheader 2>/dev/null \
+    | awk -F', ' 'int($2) > 100 {print $1}' \
+    | while read -r uuid; do
+        nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null \
+          | awk -F', ' -v u="$uuid" '$2 == u {print $1}'
+      done)"
+
+  # GPUs already reserved by other worker-agent containers on this host.
+  claimed_by_containers="$(docker ps --format '{{.Names}}' 2>/dev/null \
+    | while read -r name; do
+        docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$name" 2>/dev/null \
+          | grep -E '^GPU_ID=' | cut -d= -f2
+      done | tr -d ' ')"
+
+  occupied="$(printf '%s\n%s\n' "$busy_gpus" "$claimed_by_containers" | sort -u)"
+
+  for candidate in $all_gpus; do
+    if ! printf '%s\n' "$occupied" | grep -qx "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+if [[ "$MODE" == "real" && -z "$GPU_ID" ]]; then
+  auto_gpu="$(pick_next_gpu)"
+  if [[ -n "$auto_gpu" ]]; then
+    GPU_ID="$auto_gpu"
+    ok "auto-selected GPU_ID=${GPU_ID} (next free card on this host)"
+  else
+    warn "no free GPU detected — falling back to GPU_ID=0"
+    GPU_ID=0
+  fi
+elif [[ -z "$GPU_ID" ]]; then
+  # mock mode → doesn't touch the GPU; a value is still written so the
+  # container's rollout script has something to read.
+  GPU_ID=0
+fi
+
 # In real mode, check for NVIDIA runtime
 if [[ "$MODE" == "real" ]]; then
   if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -182,8 +255,62 @@ if [[ "$MODE" == "real" ]]; then
   fi
 fi
 
-# Host port. Central-plane dev boxes often already use 8080; default 8081.
-HOST_PORT="$(env_get WORKER_HOST_PORT)"; HOST_PORT="${HOST_PORT:-8081}"
+# ── Host port auto-selection ─────────────────────────────────────────
+# Every worker container needs its OWN host port because central will
+# hand out `WORKER_PUBLIC_URL/upload/{token}` to student browsers — two
+# workers on the same host can't both bind :8081.
+#
+# Preference order:
+#   1. If .env already has WORKER_HOST_PORT, reuse (so re-runs are
+#      idempotent and the operator's reverse-proxy config keeps working).
+#   2. Else walk from 8081 upward and pick the first port that is
+#      neither bound on the host nor already declared in ANOTHER
+#      worker-agent container's WORKER_HOST_PORT env.
+port_in_use() {
+  # returns 0 if $1 is bound on the host
+  ss -Hltn "sport = :$1" 2>/dev/null | grep -q ":$1"
+}
+port_claimed_by_container() {
+  # returns 0 if some running container was started with WORKER_HOST_PORT=$1
+  docker ps --format '{{.Names}}' 2>/dev/null \
+    | while read -r n; do
+        docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$n" 2>/dev/null \
+          | grep -E "^WORKER_HOST_PORT=$1$" && return 0
+      done
+  return 1
+}
+pick_free_port() {
+  local p=8081
+  while :; do
+    if ! port_in_use "$p" && ! port_claimed_by_container "$p"; then
+      echo "$p"; return 0
+    fi
+    p=$(( p + 1 ))
+    (( p > 8181 )) && { echo ""; return 1; }
+  done
+}
+
+HOST_PORT="$(env_get WORKER_HOST_PORT)"
+if [[ -z "$HOST_PORT" ]]; then
+  HOST_PORT="$(pick_free_port)"
+  if [[ -n "$HOST_PORT" ]]; then
+    ok "auto-selected WORKER_HOST_PORT=${HOST_PORT} (first free in 8081-8181)"
+  else
+    die "no free port found in 8081-8181 — free one up or pass WORKER_HOST_PORT in .env"
+  fi
+fi
+
+# Derive a unique container name so two workers on the same host can
+# coexist under docker compose. Falls back to worker-agent-<port>.
+CONTAINER_NAME="worker-agent-${HOST_PORT}"
+
+# If the operator didn't explicitly set WORKER_PUBLIC_URL, and the guess
+# defaulted to :8081, patch it to the actually-picked port so central
+# hands out reachable URLs.
+if [[ "$PUBLIC_URL" == *":8081" && "$HOST_PORT" != "8081" ]]; then
+  PUBLIC_URL="${PUBLIC_URL%:*}:${HOST_PORT}"
+  ok "adjusted WORKER_PUBLIC_URL → ${PUBLIC_URL} to match host port"
+fi
 
 # ── 4. write .env atomically ─────────────────────────────────────────
 # Only rewrite when we actually gathered new values from a prompt/flag,
@@ -215,7 +342,7 @@ WORKER_PUBLIC_URL=${PUBLIC_URL}
 WORKER_STORAGE_ROOT=/var/lib/worker-agent/storage
 WORKER_STATE_DIR=/var/lib/worker-agent/state
 
-GPU_ID=0
+GPU_ID=${GPU_ID}
 EVAL_MODE=${MODE}
 ISAAC_SIM_SCRIPT_PATH=/aicapstone/scripts/rollout.py
 
@@ -227,10 +354,14 @@ WORKER_HOST_PORT=${HOST_PORT}
 
 MAX_CONCURRENT_EVALS=1
 ALLOWED_TASK_KEYS=cup_stacking,cutlery_arrangement,toy_block_collection
+
+# Unique docker container name so multiple worker clones on the same
+# host (each in its own directory / port) don't collide.
+WORKER_CONTAINER_NAME=${CONTAINER_NAME}
 EOF
   chmod 600 "$TMP"
   mv "$TMP" .env
-  ok ".env written (${HOST_PORT} → 8080)"
+  ok ".env written (host port ${HOST_PORT} → container 8080, container=${CONTAINER_NAME})"
 fi
 
 # ── 5. build + start ─────────────────────────────────────────────────

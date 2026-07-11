@@ -10,12 +10,16 @@
 services:
   worker-agent:
     build: .
-    container_name: worker-agent
+    # Container name is derived from the host port by setup.sh so
+    # multiple worker clones on the same host each get a unique name
+    # (worker-agent-8081, worker-agent-8082, ...). Without this the
+    # second `docker compose up` errors with "name is already in use".
+    container_name: ${WORKER_CONTAINER_NAME:-worker-agent}
     restart: unless-stopped
     ports:
-      # WORKER_HOST_PORT is written by setup.sh (default 8081); if you're
-      # sharing a host with the central dev backend that also binds 8080,
-      # keep it at 8081.
+      # setup.sh walks 8081..8181 to find the first free port; central
+      # hands out WORKER_PUBLIC_URL/upload/<token> to student browsers,
+      # so each worker on a shared host must expose its OWN port.
       - "${WORKER_HOST_PORT:-8081}:8080"
     env_file: .env
     # Needed so the worker container can reach the central backend at
