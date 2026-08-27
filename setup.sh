@@ -46,8 +46,8 @@ die()  { printf '%s✗ %s%s\n' "$RED" "$*" "$RST" >&2; exit 1; }
 hdr()  { printf '\n%s══ %s ══%s\n' "$BOLD" "$*" "$RST"; }
 
 # ── args ─────────────────────────────────────────────────────────────
-DEFAULT_CENTRAL_URL="https://leaderboard.hcislab.tw"
-CLI_TOKEN=""; CLI_PUBLIC_URL=""; CLI_NAME=""; CLI_MODE=""; CLI_CENTRAL=""
+DEFAULT_CENTRAL_URL="https://hcislab.ddns.net"
+CLI_TOKEN=""; CLI_PUBLIC_URL=""; CLI_NAME=""; CLI_MODE=""; CLI_CENTRAL=""; CLI_HF_TOKEN=""
 YES=0; RESET=0; STATUS_ONLY=0
 
 for arg in "$@"; do
@@ -57,6 +57,7 @@ for arg in "$@"; do
     --name=*)        CLI_NAME="${arg#*=}" ;;
     --mode=*)        CLI_MODE="${arg#*=}" ;;
     --central=*)     CLI_CENTRAL="${arg#*=}" ;;
+    --hf-token=*)    CLI_HF_TOKEN="${arg#*=}" ;;
     --gpu-id=*)      : ;;  # consumed later so `pick_next_gpu` can still auto-detect
     --yes|-y)        YES=1 ;;
     --reset)         RESET=1 ;;
@@ -124,6 +125,7 @@ JOIN_TOKEN="${CLI_TOKEN:-$(env_get WORKER_JOIN_TOKEN)}"
 PUBLIC_URL="${CLI_PUBLIC_URL:-$(env_get WORKER_PUBLIC_URL)}"
 WORKER_NAME="${CLI_NAME:-$(env_get WORKER_NAME)}"
 MODE="${CLI_MODE:-$(env_get EVAL_MODE)}"
+HF_TOKEN_VAL="${CLI_HF_TOKEN:-$(env_get HF_TOKEN)}"
 
 prompt() {
   # prompt VAR "label" "default"
@@ -166,8 +168,21 @@ if [[ -z "$PUBLIC_URL" ]]; then
   prompt PUBLIC_URL "Worker public URL" "$guess"
 fi
 
-# Mode — default mock for safe smoke test
-[[ -n "$MODE" ]] || prompt MODE "Evaluation mode (mock|real)" "mock"
+# Mode — default 'real' since partner-school workers always want Isaac
+# Sim; flip to mock explicitly with `--mode=mock` for a smoke test.
+[[ -n "$MODE" ]] || prompt MODE "Evaluation mode (mock|real)" "real"
+
+# HuggingFace token — optional. lerobot policies (multi_task_dit,
+# smolvla, pi0, …) download weights from huggingface.co on first use.
+# Without a token you're subject to the anonymous rate limit (occasional
+# 429 during simultaneous evals). Any token with `read` scope works —
+# create one at https://huggingface.co/settings/tokens. Skip with Enter.
+if [[ -z "$HF_TOKEN_VAL" ]] && (( ! YES )); then
+  say ""
+  say "${DIM}Optional — HuggingFace token for lerobot weight downloads.${RST}"
+  say "${DIM}Get one at https://huggingface.co/settings/tokens (read scope). Press Enter to skip.${RST}"
+  prompt HF_TOKEN_VAL "HF_TOKEN (optional)"
+fi
 
 case "$MODE" in
   mock|real) ;;
@@ -322,7 +337,8 @@ if [[ -f .env && \
       "$JOIN_TOKEN"  == "$(env_get WORKER_JOIN_TOKEN)" && \
       "$PUBLIC_URL"  == "$(env_get WORKER_PUBLIC_URL)" && \
       "$WORKER_NAME" == "$(env_get WORKER_NAME)" && \
-      "$MODE"        == "$(env_get EVAL_MODE)" ]]; then
+      "$MODE"        == "$(env_get EVAL_MODE)" && \
+      "$HF_TOKEN_VAL" == "$(env_get HF_TOKEN)" ]]; then
   existing_matches=1
 fi
 
@@ -358,6 +374,11 @@ ALLOWED_TASK_KEYS=cup_stacking,cutlery_arrangement,toy_block_collection
 # Unique docker container name so multiple worker clones on the same
 # host (each in its own directory / port) don't collide.
 WORKER_CONTAINER_NAME=${CONTAINER_NAME}
+
+# Optional HuggingFace token — lerobot policies download weights on
+# first eval. Anonymous rate limit is ~10 req/hr per IP so parallel
+# evals easily hit 429; a read-scope token removes that limit.
+HF_TOKEN=${HF_TOKEN_VAL}
 EOF
   chmod 600 "$TMP"
   mv "$TMP" .env

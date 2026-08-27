@@ -36,7 +36,7 @@ log = logging.getLogger("worker.server")
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="AI Capstone Worker Agent",
+        title="Physical AI Worker Agent",
         version="1.0.0",
         docs_url="/docs" if cfg.eval_mode == "mock" else None,
     )

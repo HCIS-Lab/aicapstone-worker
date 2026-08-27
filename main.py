@@ -112,7 +112,17 @@ def _handle_job(job: dict) -> None:
     try:
         log.info("starting rollout sid=%d task=%s dataset=%s",
                  sid, job.get("task_name"), job.get("dataset"))
-        result = run_rollout(sid, job.get("task_name") or "", job.get("dataset") or "public")
+        # Bridge rollout progress → central so students see live episode
+        # ticks + log lines instead of an opaque RUNNING badge.
+        def _on_progress(**kwargs):
+            try:
+                client.report_progress(sid, **kwargs)
+            except Exception:
+                pass   # best-effort, do NOT slow the eval loop
+        result = run_rollout(
+            sid, job.get("task_name") or "", job.get("dataset") or "public",
+            on_progress=_on_progress,
+        )
         log.info("rollout finished sid=%d status=%s rate=%s",
                  sid, result.status, result.success_rate)
         client.report_result(
@@ -155,12 +165,67 @@ def _handle_job(job: dict) -> None:
             pass
 
 
+def _handle_config_validation(job: dict) -> None:
+    """Central asked us to dry-load a task config in Isaac Sim.
+
+    MVP behavior:
+      * If EVAL_MODE == 'mock' or the sim script isn't present, we do a
+        cheap Python syntax check and report `skipped`.
+      * If real mode + script exists, we `exec` the config content in an
+        isolated scope with `__task_cfg` conventions — matches how the
+        rollout script imports task configs. Report `load_ok` /
+        `load_failed` based on whether it runs cleanly.
+    """
+    import ast
+    cid = job["config_id"]
+    src = job.get("config_file_content") or ""
+    log.info("validating config #%d (%d bytes)", cid, len(src))
+    status = "skipped"
+    note = ""
+    log_tail = ""
+    try:
+        ast.parse(src)   # cheap Python syntax check — first line of defence
+    except SyntaxError as exc:
+        status = "load_failed"
+        note = f"Python syntax error: {exc}"
+        client.report_config_validation(cid, status=status, note=note)
+        return
+
+    if cfg.eval_mode != "real":
+        status = "skipped"
+        note = "worker is in mock mode — reported syntax-check only"
+    else:
+        # Attempt to import the config into a sandbox scope. Doesn't cover
+        # the Isaac Sim import chain, but catches most typos.
+        scope = {"__name__": "__validate__"}
+        try:
+            exec(compile(src, f"config-{cid}", "exec"), scope, scope)
+            status = "load_ok"
+            note = "exec succeeded outside Isaac Sim"
+        except Exception as exc:
+            status = "load_failed"
+            note = f"exec raised: {type(exc).__name__}: {exc}"
+            import traceback
+            log_tail = traceback.format_exc()[-8000:]
+    try:
+        client.report_config_validation(cid, status=status, note=note, log_tail=log_tail or None)
+    except Exception as exc:
+        log.exception("failed to report config validation result: %s", exc)
+
+
 def job_poll_loop() -> None:
     while not _stop_flag.is_set():
         try:
             job = client.next_job()
             if job:
-                _handle_job(job)
+                # /next-job now multiplexes two job types. Legacy responses
+                # without job_type fall back to the submission branch so
+                # older central deployments keep working.
+                jt = job.get("job_type") or "submission"
+                if jt == "config_validation":
+                    _handle_config_validation(job)
+                else:
+                    _handle_job(job)
                 continue  # try immediately for more — queue drained fast
         except CentralError as exc:
             log.error("next-job fatal: %s", exc)
@@ -172,8 +237,22 @@ def job_poll_loop() -> None:
 _threads: list[threading.Thread] = []
 
 
+# Idempotency guard: some launch patterns (`python -m worker_agent.main`
+# followed by uvicorn re-importing the same module as "worker_agent.main")
+# fire `_startup` twice, doubling every background thread — heartbeat
+# lands twice per interval AND the job-poll loop grabs two submissions at
+# once. Keep this flag module-level so ANY startup path only spawns once.
+_startup_done = False
+
+
 @app.on_event("startup")
 def _startup():
+    global _startup_done
+    if _startup_done:
+        log.info("startup already ran — skipping duplicate registration")
+        return
+    _startup_done = True
+
     cfg.check_or_die()
     _bootstrap_auth()
     if _stop_flag.is_set():

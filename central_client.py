@@ -177,9 +177,74 @@ class CentralClient:
             log.warning("next-job unexpected %d: %s", r.status_code, r.text[:200])
             return None
         data = r.json()
-        if not data.get("submission_id"):
+        # Multiplexed shape: a submission has `submission_id`, a
+        # config-validation job has `config_id`. If neither, the poll
+        # just timed out with nothing to do.
+        if not (data.get("submission_id") or data.get("config_id")):
             return None
         return data
+
+    # ── Progress (non-terminal) ─────────────────────────────────────
+    def report_progress(
+        self, submission_id: int, *,
+        phase: Optional[str] = None,
+        episode: Optional[int] = None,
+        episode_total: Optional[int] = None,
+        config_index: Optional[int] = None,
+        config_total: Optional[int] = None,
+        config_name: Optional[str] = None,
+        cumulative_success_rate: Optional[float] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """Fire-and-forget progress ping. Best-effort — a network blip
+        just drops the update, we don't want a laggy central to slow the
+        eval loop. Central fans this out into Redis so the student's
+        status page + admin log stream see it live."""
+        body = {
+            "phase": phase, "episode": episode, "episode_total": episode_total,
+            "config_index": config_index, "config_total": config_total,
+            "config_name": config_name,
+            "cumulative_success_rate": cumulative_success_rate,
+            "message": message,
+        }
+        # Strip Nones to keep the payload small — endpoint treats missing
+        # fields as "unchanged".
+        body = {k: v for k, v in body.items() if v is not None}
+        if not body:
+            return
+        try:
+            resp = self._client.post(
+                f"/api/workers/submissions/{submission_id}/progress",
+                headers=self._auth_headers(),
+                json=body,
+                timeout=3.0,   # tight — we don't want to block the eval on this
+            )
+            if resp.status_code not in (200, 204):
+                log.debug("progress ignored sid=%d code=%d", submission_id, resp.status_code)
+        except Exception as exc:
+            log.debug("progress post failed sid=%d: %s", submission_id, exc)
+
+    # ── Config validation result ────────────────────────────────────
+    def report_config_validation(
+        self, config_id: int, *,
+        status: str,
+        note: Optional[str] = None,
+        log_tail: Optional[str] = None,
+    ) -> None:
+        """Terminal report for a config-validation job. Raises on non-2xx
+        so the caller can log — the outer loop already swallows
+        exceptions so this won't crash the poll thread."""
+        body = {"status": status, "note": note, "log_tail": log_tail}
+        r = self._client.post(
+            f"/api/workers/config-validations/{config_id}/result",
+            headers=self._auth_headers(),
+            json=body,
+        )
+        if r.status_code != 200:
+            log.error("config-validation POST failed cid=%d code=%d body=%s",
+                      config_id, r.status_code, r.text[:200])
+        r.raise_for_status()
+        log.info("reported config validation cid=%d status=%s", config_id, status)
 
     # ── Result ──────────────────────────────────────────────────────
     def report_result(

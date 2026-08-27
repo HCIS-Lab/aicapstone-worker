@@ -67,7 +67,7 @@ class WorkerConfig:
         # `mock` = don't call rollout.py, just return a random score.
         # `real` = exec rollout.py in a subprocess. `mock` is useful for
         # smoke-testing the agent against a dev central without a GPU.
-        self.eval_mode: str = os.getenv("EVAL_MODE", "mock").lower()
+        self.eval_mode: str = os.getenv("EVAL_MODE", "real").lower()
 
         # ── Loop tuning ───────────────────────────────────────────────
         self.heartbeat_interval_sec: int = int(

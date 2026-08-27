@@ -68,17 +68,43 @@ def _extract_zip(sid: int) -> Path:
     return target
 
 
-def _mock_rollout(sid: int) -> RolloutResult:
+def _mock_rollout(sid: int, on_progress=None) -> RolloutResult:
     """Random success rate after a short sleep. `sid` seeds the RNG so
     the same submission always mocks the same rate — makes end-to-end
-    smoke tests deterministic."""
+    smoke tests deterministic.
+
+    If `on_progress` is provided (callable), we call it every N episodes
+    so the smoke test path also exercises the live-progress pipeline.
+    """
     rng = random.Random(sid)
-    time.sleep(rng.uniform(1.0, 3.0))
-    rate = round(rng.uniform(0.4, 0.95), 4)
-    episodes = [
-        {"episode_id": i, "success": rng.random() < rate}
-        for i in range(30)
-    ]
+    total_eps = 30
+    episodes = []
+    ok = 0
+    if on_progress:
+        try: on_progress(phase="staging", message="[mock] warming up")
+        except Exception: pass
+    for i in range(total_eps):
+        # spread the fake work across ~2s total so students see a
+        # progress bar move rather than a single FINISHED flash
+        time.sleep(0.06)
+        success = rng.random() < 0.75
+        episodes.append({"episode_id": i, "success": success})
+        if success:
+            ok += 1
+        if on_progress and (i % 3 == 2 or i == total_eps - 1):
+            try:
+                on_progress(
+                    phase="evaluating",
+                    episode=i + 1, episode_total=total_eps,
+                    cumulative_success_rate=round(ok / (i + 1), 4),
+                    message=f"[mock] episode {i+1}/{total_eps} → {'ok' if success else 'fail'}",
+                )
+            except Exception:
+                pass
+    rate = round(ok / total_eps, 4)
+    if on_progress:
+        try: on_progress(phase="cleanup", message=f"[mock] final rate {rate:.3f}")
+        except Exception: pass
     return RolloutResult(
         status="FINISHED",
         success_rate=rate,
@@ -95,10 +121,79 @@ _FINAL_RE = re.compile(
 )
 
 
-def _real_rollout(sid: int, task_name: str, dataset: str) -> RolloutResult:
-    """Exec rollout.py against the extracted policy. Streams stdout
-    with nonce framing so any output the student's model printed at
-    import time can't spoof the final score line."""
+# Per-policy defaults for --policy_action_horizon; must match the
+# central-side `ACTION_HORIZON_DEFAULTS` in
+# backend/app/evaluation/evaluator.py.
+_ACTION_HORIZON_DEFAULTS = {
+    "lerobot-diffusion": 8, "smolvla": 8, "groot": 8, "XVLA": 8,
+    "multi_task_dit": 8, "wall_x": 8,
+    "pi0": 50, "pi0_fast": 50, "pi05": 50, "act": 50,
+}
+
+
+def _detect_policy_type(extracted: Path) -> Optional[str]:
+    """Read the policy_type from the standard checkpoint JSONs.
+
+    Order:
+      1. config.json → `policy_type` / `type` / `model_type` / `policy`
+      2. train_config.json → same keys
+      3. None (caller decides how to bail)
+    Kept small on purpose — the full tokenizer + path-heuristic mess
+    lives in the central evaluator; this fallback covers the ~90 % case
+    where the trainer writes the type explicitly.
+    """
+    import json as _json
+    keys = ("policy_type", "type", "model_type", "policy", "name")
+    for fname in ("config.json", "train_config.json"):
+        p = extracted / fname
+        if not p.is_file():
+            continue
+        try:
+            with p.open() as f:
+                blob = _json.load(f)
+        except Exception:
+            continue
+        if not isinstance(blob, dict):
+            continue
+        for k in keys:
+            v = blob.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def _resolve_action_horizon(policy_type: str, extracted: Path) -> int:
+    """Pull `n_action_steps` from train_config.json if the trainer set
+    it explicitly; otherwise use the per-policy default; otherwise 1."""
+    import json as _json
+    for fname in ("train_config.json", "config.json"):
+        p = extracted / fname
+        if not p.is_file():
+            continue
+        try:
+            with p.open() as f:
+                blob = _json.load(f)
+        except Exception:
+            continue
+        if isinstance(blob, dict):
+            v = blob.get("n_action_steps")
+            if isinstance(v, int) and v > 0:
+                return v
+    return _ACTION_HORIZON_DEFAULTS.get(policy_type, 1)
+
+
+def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> RolloutResult:
+    """Exec rollout.py against the extracted policy.
+
+    Command shape matches the central `EVAL_CMD_TEMPLATE`:
+      python <script> --task=... --policy_type=... --policy_checkpoint_path=...
+                      --policy_action_horizon=N --device=cuda:0 --headless
+                      --enable_cameras --eval_rounds=50|100 --episode_length_s=N
+                      --video_out=<path>
+
+    Output is nonce-framed so import-time `print()` from the student's
+    model can't spoof the final score line.
+    """
     script = Path(cfg.isaac_sim_script)
     if not script.is_file():
         return RolloutResult(
@@ -106,36 +201,121 @@ def _real_rollout(sid: int, task_name: str, dataset: str) -> RolloutResult:
             error_message=f"rollout script not found at {script}",
         )
     extracted = extracted_dir_for(sid)
+
+    policy_type = _detect_policy_type(extracted)
+    if not policy_type:
+        return RolloutResult(
+            status="FAILED",
+            error_message=(
+                "could not detect policy_type from checkpoint — expected a "
+                "'policy_type'/'type'/'model_type' key in config.json or "
+                "train_config.json"
+            ),
+        )
+    action_horizon = _resolve_action_horizon(policy_type, extracted)
+    eval_rounds = "50" if dataset == "public" else "100"
+    episode_length_s = os.getenv("EVAL_EPISODE_LENGTH_S", "").strip() or "60"
+    device = os.getenv("EVAL_DEVICE", "").strip() or "cuda:0"
+
     nonce = uuid.uuid4().hex
+    inner_cmd = (
+        f'python {script} '
+        f'--task=/private_tasks/{task_name}_eval.py '
+        f'--policy_type={policy_type} '
+        f'--policy_checkpoint_path={extracted} '
+        f'--policy_action_horizon={action_horizon} '
+        f'--device={device} '
+        f'--headless '
+        f'--enable_cameras '
+        f'--eval_rounds={eval_rounds} '
+        f'--episode_length_s={episode_length_s}'
+    )
     cmd = [
         "bash", "-c",
-        f'echo "LB-START-{nonce}" && '
-        f'python {script} --task=/private_tasks/{task_name}_eval.py '
-        f'--checkpoint_dir={extracted} '
-        f'--eval_rounds={"50" if dataset == "public" else "100"} '
-        f'&& echo "LB-END-{nonce}"'
+        f'echo "LB-START-{nonce}"; '
+        f'{inner_cmd}; '
+        f'rc=$?; '
+        f'echo "LB-END-{nonce}"; '
+        f'exit $rc'
     ]
     started = time.time()
+    # Flip status to RUNNING the moment we kick off Isaac Sim.
+    if on_progress:
+        try:
+            on_progress(
+                phase="loading_sim",
+                episode_total=int(eval_rounds),
+                message=f"[worker] launching Isaac Sim (policy={policy_type}, "
+                        f"eval_rounds={eval_rounds})",
+            )
+        except Exception:
+            pass
+
+    # ── Streaming subprocess ────────────────────────────────────────
+    # `subprocess.run(capture_output=True)` buffers everything in memory
+    # and returns only once the child exits — nothing reaches the /ws/logs
+    # stream while Isaac Sim is booting. Switch to Popen with merged
+    # stderr → stdout, read line-by-line in the main thread, and forward
+    # each line to `on_progress(message=line)` so the browser Watch modal
+    # and the per-episode progress bar both come alive.
+    _EP_RE = re.compile(r"\[Evaluation\]\s+Evaluating\s+episode\s+(\d+)", re.IGNORECASE)
+    ep_total = int(eval_rounds)
+    stdout_chunks: list[str] = []
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,   # merge so ordering is preserved for the log stream
+        text=True,
+        bufsize=1,                  # line-buffered
+        start_new_session=True,
+    )
+    timeout_at = started + int(os.getenv("EVAL_TIMEOUT_SEC", "10800"))
+    timed_out = False
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=int(os.getenv("EVAL_TIMEOUT_SEC", "10800")),
-            # Each rollout gets its own process group so a SIGTERM to
-            # this agent kills the sim process too — matches the
-            # `start_new_session=True` behaviour on the Celery worker.
-            start_new_session=True,
-        )
-    except subprocess.TimeoutExpired as exc:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            stdout_chunks.append(raw)
+            # Forward every line to the live log stream. Best-effort —
+            # network hiccups shouldn't break the rollout.
+            if on_progress and line:
+                try:
+                    kwargs: dict = {"message": line[-1024:]}
+                    # Parse `[Evaluation] Evaluating episode N` markers
+                    # to drive the per-episode progress bar.
+                    m = _EP_RE.search(line)
+                    if m:
+                        kwargs["phase"] = "evaluating"
+                        kwargs["episode"] = int(m.group(1))
+                        kwargs["episode_total"] = ep_total
+                    on_progress(**kwargs)
+                except Exception:
+                    pass
+            if time.time() > timeout_at:
+                timed_out = True
+                break
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    proc.wait()
+    duration = time.time() - started
+    stdout = "".join(stdout_chunks)
+    combined = stdout.strip()
+    if timed_out:
         return RolloutResult(
             status="FAILED",
             error_message="eval timed out",
-            error_log=(exc.stdout or "") + (exc.stderr or ""),
-            duration_sec=time.time() - started,
+            error_log=combined[-8192:],
+            duration_sec=duration,
+            detected_policy_type=policy_type,
         )
-    duration = time.time() - started
-    stdout = proc.stdout or ""
 
     # Trust only the nonce-framed region — student `print()` outside is dropped.
     start_marker = f"LB-START-{nonce}"
@@ -143,9 +323,13 @@ def _real_rollout(sid: int, task_name: str, dataset: str) -> RolloutResult:
     if start_marker not in stdout or end_marker not in stdout:
         return RolloutResult(
             status="FAILED",
-            error_message="nonce framing missing — rollout did not exit cleanly",
-            error_log=stdout[-4096:],
+            error_message=(
+                f"nonce framing missing — rollout did not exit cleanly "
+                f"(exit_code={proc.returncode})"
+            ),
+            error_log=combined[-8192:],
             duration_sec=duration,
+            detected_policy_type=policy_type,
         )
     body = stdout.split(start_marker, 1)[1].split(end_marker, 1)[0]
 
@@ -154,8 +338,9 @@ def _real_rollout(sid: int, task_name: str, dataset: str) -> RolloutResult:
         return RolloutResult(
             status="FAILED",
             error_message="no Final success rate line found",
-            error_log=body[-4096:],
+            error_log=combined[-8192:],
             duration_sec=duration,
+            detected_policy_type=policy_type,
         )
     m = matches[-1]  # only last match counts (anti-cheat)
     rate = float(m.group(1))
@@ -166,13 +351,21 @@ def _real_rollout(sid: int, task_name: str, dataset: str) -> RolloutResult:
         success_rate=rate,
         episodes=episodes,
         duration_sec=duration,
+        detected_policy_type=policy_type,
     )
 
 
-def run_rollout(sid: int, task_name: str, dataset: str) -> RolloutResult:
+def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> RolloutResult:
     """Entry point called by the agent's job-poll loop after a
     successful `/next-job`. Extracts the zip then delegates to the
-    appropriate backend."""
+    appropriate backend.
+
+    `on_progress(**kwargs)` — if provided, called with the same fields
+    accepted by CentralClient.report_progress. Currently wired for mock
+    mode; real mode's subprocess still finalises before we hear anything,
+    so per-episode progress requires the sim script to emit episode
+    markers we can grep. (See _real_rollout — extension point.)
+    """
     if not zip_path_for(sid).is_file():
         return RolloutResult(
             status="FAILED",
@@ -187,5 +380,5 @@ def run_rollout(sid: int, task_name: str, dataset: str) -> RolloutResult:
         )
     if cfg.eval_mode == "mock":
         log.info("[mock] rolling submission %d", sid)
-        return _mock_rollout(sid)
-    return _real_rollout(sid, task_name, dataset)
+        return _mock_rollout(sid, on_progress=on_progress)
+    return _real_rollout(sid, task_name, dataset, on_progress=on_progress)

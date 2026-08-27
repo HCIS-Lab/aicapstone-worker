@@ -1,0 +1,82 @@
+# Real Isaac Sim worker image.
+#
+# Reuses the leaderboard_worker_real image (already has isaacsim 5.1 +
+# IsaacLab + the aicapstone simulator + a Python 3.12 lerobot sidecar
+# venv baked in) and layers the worker_agent runtime deps on top. This
+# is a NON-federated fast-path for the dev host: production schools
+# build this image standalone (git clone worker_agent + aicapstone;
+# see STARTUP.md).
+#
+# Requires:
+#   * NVIDIA driver on the host + nvidia-container-toolkit
+#   * The image `leaderboard_worker_real:latest` to already exist locally
+#     (built via the pre-federation flow — worker.Dockerfile in git
+#     history HEAD~10 documents how to build it fresh).
+FROM leaderboard_worker_real:latest
+
+# worker_agent's Python runtime deps — separate from the isaacsim
+# environment installed in the base image.
+RUN pip install --no-cache-dir \
+        "fastapi==0.115.0" \
+        "uvicorn[standard]==0.30.0" \
+        "httpx==0.27.2" \
+        "python-multipart==0.0.9" \
+        "pydantic==2.9.0" \
+        "pydantic-settings==2.5.0"
+
+# Copy worker_agent source — mounted over at runtime by docker-compose
+# so code edits don't require rebuild, but bake a copy for hermetic runs.
+# NOTE: build with `docker build -f worker_agent/Dockerfile.real .` so the
+# build context is the leaderboard repo root and both `worker_agent/` and
+# `private_tasks/` are visible.
+COPY worker_agent/ /app/worker_agent/
+
+# Bake the private task-config .py files into the image at /private_tasks
+# so remote workers using this image without any bind-mount can find them
+# at the default `--task=/private_tasks/{task_name}_eval.py` path. Also
+# copy into /workspace/aicapstone/private_tasks so both symlink paths
+# resolve the same content.
+COPY private_tasks/ /private_tasks/
+
+# The base image inherits ENTRYPOINT from isaacsim/IsaacLab launchers
+# (`/isaac-sim/python.sh` in some layers). Override so the worker's
+# main loop runs instead.
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    WORKER_STORAGE_ROOT=/var/lib/worker-agent/storage \
+    WORKER_STATE_DIR=/var/lib/worker-agent/state \
+    WORKER_PORT=8080
+RUN mkdir -p /var/lib/worker-agent/storage /var/lib/worker-agent/state
+
+# The base image installs the aicapstone tree at /workspace/aicapstone.
+# The worker's default `ISAAC_SIM_SCRIPT_PATH=/aicapstone/scripts/rollout.py`
+# assumes it's at /aicapstone (matches the LOCAL demo bind-mount layout).
+# Symlink so both paths resolve. NOT symlinking `/private_tasks` because
+# the COPY above baked real files there — schools that DON'T bind-mount
+# their own private_tasks pick up the baked copy.
+RUN ln -snf /workspace/aicapstone /aicapstone
+
+# Bake a pre-warmed Omniverse Kit cache captured from a `--validate_only`
+# run of one of the eval tasks. Saves ~30s of shader-compile + registry
+# lookup on a school's very first real eval. The cache is small (~15 MB
+# uncompressed / 4 MB tarball) because heavy USDs are already baked into
+# /workspace/aicapstone. Runtime writes to a mounted volume so this seed
+# only matters until the volume grows its own copy.
+COPY worker_agent/ov-cache.tgz /tmp/ov-cache.tgz
+RUN mkdir -p /root/.cache/ov \
+ && tar xzf /tmp/ov-cache.tgz -C /root/.cache/ov \
+ && rm /tmp/ov-cache.tgz
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+EXPOSE 8080
+ENTRYPOINT []
+# Invoke uvicorn directly so `worker_agent.main` is imported ONCE. Using
+# `python -m worker_agent.main` also worked but Python treats the entry
+# module both as `__main__` and as `worker_agent.main` — that duplicated
+# every `@app.on_event('startup')` handler, spawning two heartbeat and
+# two job-poll threads. `_startup` also has an idempotency guard now,
+# but this belt-AND-braces prevents the whole class of issue.
+CMD ["uvicorn", "worker_agent.main:app", "--host", "0.0.0.0", "--port", "8080"]
