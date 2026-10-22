@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+# Simulator checkout cloned by setup.sh (pinned by AICAPSTONE_REF in .env)
+aicapstone/
+__pycache__/

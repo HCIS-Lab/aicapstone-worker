@@ -184,7 +184,30 @@ def _resolve_action_horizon(policy_type: str, extracted: Path) -> int:
     return _ACTION_HORIZON_DEFAULTS.get(policy_type, 1)
 
 
-def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> RolloutResult:
+def task_config_dir_for(sid: int) -> Path:
+    # Own directory, NOT inside extracted/: rollout.py puts the config's
+    # parent on sys.path, which must never contain student files.
+    return submission_dir(sid) / "task_config"
+
+
+def _resolve_task_file(sid: int, task_name: str, task_config: Optional[dict]) -> Optional[Path]:
+    """Write the centrally served eval config to disk, or fall back to a
+    locally mounted /private_tasks (older central / single-host dev)."""
+    if task_config and task_config.get("content"):
+        d = task_config_dir_for(sid)
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{task_name}_eval.py"
+        f.write_text(task_config["content"], encoding="utf-8")
+        f.chmod(0o600)
+        log.info("task config %s from central (sha256 %s)",
+                 task_config.get("filename"), str(task_config.get("sha256", ""))[:12])
+        return f
+    local = Path(f"/private_tasks/{task_name}_eval.py")
+    return local if local.is_file() else None
+
+
+def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
+                  task_config: Optional[dict] = None) -> RolloutResult:
     """Exec rollout.py against the extracted policy.
 
     Command shape matches the central `EVAL_CMD_TEMPLATE`:
@@ -203,6 +226,12 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> R
             error_message=f"rollout script not found at {script}",
         )
     extracted = extracted_dir_for(sid)
+    task_file = _resolve_task_file(sid, task_name, task_config)
+    if task_file is None:
+        return RolloutResult(
+            status="FAILED",
+            error_message=f"no eval config for task '{task_name}' (central did not serve one)",
+        )
 
     policy_type = _detect_policy_type(extracted)
     if not policy_type:
@@ -222,7 +251,7 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> R
     nonce = uuid.uuid4().hex
     inner_cmd = (
         f'python {script} '
-        f'--task=/private_tasks/{task_name}_eval.py '
+        f'--task={task_file} '
         f'--policy_type={policy_type} '
         f'--policy_checkpoint_path={extracted} '
         f'--policy_action_horizon={action_horizon} '
@@ -372,7 +401,8 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> R
     )
 
 
-def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> RolloutResult:
+def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
+                task_config: Optional[dict] = None) -> RolloutResult:
     """Entry point called by the agent's job-poll loop after a
     successful `/next-job`. Extracts the zip then delegates to the
     appropriate backend.
@@ -398,4 +428,5 @@ def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> Rol
     if cfg.eval_mode == "mock":
         log.info("[mock] rolling submission %d", sid)
         return _mock_rollout(sid, on_progress=on_progress)
-    return _real_rollout(sid, task_name, dataset, on_progress=on_progress)
+    return _real_rollout(sid, task_name, dataset, on_progress=on_progress,
+                         task_config=task_config)

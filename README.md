@@ -38,10 +38,12 @@ The worker agent is a small FastAPI service + a background loop:
 - **Report results** back to central; central aggregates the leaderboard
 
 Assignment is **pull-only**. Central never opens a connection to your
-worker. Every online worker for your school hits
-`POST /api/workers/next-job`; whichever asks first while free gets the
-oldest QUEUED submission. No dispatcher, cron, or coordinator is needed
-on the school side.
+worker. When a student uploads, central picks the live worker of your
+school with the shortest queue and the zip goes straight to that
+worker's disk, so the submission is pinned to it. Each worker polls
+`POST /api/workers/next-job` and receives its own pinned submissions,
+oldest first. No dispatcher, cron, or coordinator is needed on the
+school side.
 
 ```
 學生瀏覽器 ─► central: POST /api/submissions (取得 presigned URL)
@@ -187,6 +189,8 @@ Or use the `publish-worker` Makefile target if the repo defines one.
 | `WORKER_PUBLIC_URL` | *(no default)* | External URL for `/upload` — must be reachable from student browsers |
 | `WORKER_HOST_PORT` | auto-picked | First free port in `8081..8181` |
 | `EVAL_MODE` | `real` | `mock` \| `real` |
+| `AICAPSTONE_REF` | `feat/eval-rollout-fixes` | Simulator release (branch / tag / commit) that `setup.sh` clones and builds locally. Eval task configs are not part of the build — the worker fetches them from central per job |
+| `AICAPSTONE_REPO` | `https://github.com/HCIS-Lab/aicapstone.git` | Simulator source repo |
 | `ISAAC_SIM_SCRIPT_PATH` | `/aicapstone/scripts/rollout.py` | `real` mode only |
 | `WORKER_STORAGE_ROOT` | `/var/lib/worker-agent/storage` | Docker volume `worker_storage` |
 | `WORKER_STATE_DIR` | `/var/lib/worker-agent/state` | Docker volume `worker_state` |
@@ -239,7 +243,7 @@ It asks for four things (press Enter to accept each default):
 | Worker name | `$(hostname)` — e.g. `nthu-gpu0` |
 | Join token | *(paste from Step 1)* |
 | Worker public URL | *(no default)* |
-| Eval mode | `mock` for first boot; switch to `real` once verified |
+| Eval mode | `real` (builds Isaac Sim + simulator on this machine; first build ~30–60 min, ~30 GB) |
 | HuggingFace token | Optional; skip if you don't have one yet |
 
 Fully non-interactive form:
@@ -250,7 +254,7 @@ Fully non-interactive form:
   --token=<JOIN_TOKEN> \
   --public-url=https://gpu-01.your-school.edu.tw \
   --name=gpu-01 \
-  --mode=mock
+  --mode=real
 ```
 
 What `setup.sh` does end-to-end:
@@ -289,16 +293,28 @@ Both workers register under the same join token (as long as its
 `worker_storage` / `worker_ov_cache` volumes — deleting one clone
 doesn't touch the other.
 
-### Step 4 — Switch from `mock` to `real`
+### Step 4 — Updating to a new release
+
+Eval task configs need no action: the worker downloads the current one
+from central at the start of every job.
+
+When HCIS-Lab announces a new **simulator** release, set the announced
+`AICAPSTONE_REF` in `.env` and re-run setup (cached layers keep the
+rebuild short):
 
 ```bash
-sed -i 's/^EVAL_MODE=.*/EVAL_MODE=real/' .env
-docker compose up -d --force-recreate
+git pull                                   # worker code
+sed -i 's/^AICAPSTONE_REF=.*/AICAPSTONE_REF=<announced-ref>/' .env
+./setup.sh --yes
 ```
 
 Confirm the driver is new enough (`nvidia-smi` should print
 `Driver Version: 570.xxx.xx` or newer). If not, see
 [Troubleshooting §9 → `CUDA error 804`](#9-troubleshooting).
+
+**Optional mock smoke test** (no GPU, synthetic scores — never for real
+grading): `./setup.sh --mode=mock` builds a slim image locally via
+`docker-compose.mock.yml`.
 
 ---
 

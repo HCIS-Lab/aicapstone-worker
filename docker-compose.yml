@@ -3,13 +3,26 @@
 # Preferred entry point: `./setup.sh` (writes .env + brings the container up).
 # Manual path: copy .env.example → .env, edit, then `docker compose up -d`.
 #
-# For Isaac Sim / real evaluation, uncomment the GPU runtime block and add
-# the aicapstone/private_tasks bind mounts (see central worker.Dockerfile
-# for the full list).
+# Default is `real` mode, built on this machine: setup.sh clones the
+# pinned aicapstone checkout (AICAPSTONE_REF), builds the simulator base
+# image `aicapstone-sim:local` from it, then builds this service from
+# Dockerfile.real. Eval task configs are fetched from central per job.
+# For a GPU-less smoke test, setup.sh --mode=mock layers
+# docker-compose.mock.yml on top (via COMPOSE_FILE in .env).
+#
+# Update to a new release: set AICAPSTONE_REF in .env, re-run ./setup.sh
 
 services:
   worker-agent:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.real
+      additional_contexts:
+        aicapstone: ${AICAPSTONE_DIR:-./aicapstone}
+      args:
+        BASE_IMAGE: aicapstone-sim:local
+    image: aicapstone-worker-real:local
+    pull_policy: build
     # Container name is derived from the host port by setup.sh so
     # multiple worker clones on the same host each get a unique name
     # (worker-agent-8081, worker-agent-8082, ...). Without this the
@@ -38,13 +51,11 @@ services:
       # (nothing writes to it). Under `docker compose down -v` this
       # volume is wiped, forcing the next real eval to re-download.
       - worker_ov_cache:/root/.cache/ov
-      # Isaac Sim mode:
-      # - ../aicapstone:/aicapstone:ro
-      # - ../private_tasks:/private_tasks:ro
-    # runtime: nvidia    # uncomment for GPU rollout
-    # environment:
-    #   NVIDIA_VISIBLE_DEVICES: ${GPU_ID:-all}
-    #   NVIDIA_DRIVER_CAPABILITIES: graphics,display,utility,compute
+    # One GPU per worker; setup.sh picks a free GPU_ID.
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${GPU_ID:-0}
+      NVIDIA_DRIVER_CAPABILITIES: graphics,display,utility,compute
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

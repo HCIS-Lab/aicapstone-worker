@@ -1,18 +1,25 @@
-# Real Isaac Sim worker image.
+# syntax = docker/dockerfile:1.7
+# Real Isaac Sim worker image, built on the school's own machine.
 #
-# Reuses the leaderboard_worker_real image (already has isaacsim 5.1 +
-# IsaacLab + the aicapstone simulator + a Python 3.12 lerobot sidecar
-# venv baked in) and layers the worker_agent runtime deps on top. This
-# is a NON-federated fast-path for the dev host: production schools
-# build this image standalone (git clone worker_agent + aicapstone;
-# see STARTUP.md).
+# Layers the worker_agent runtime on top of the simulator base image
+# (isaacsim 5.1 + IsaacLab + the aicapstone simulator + a Python 3.12
+# lerobot sidecar venv), which setup.sh builds first from the pinned
+# aicapstone checkout:
 #
-# Requires:
-#   * NVIDIA driver on the host + nvidia-container-toolkit
-#   * The image `leaderboard_worker_real:latest` to already exist locally
-#     (built via the pre-federation flow — worker.Dockerfile in git
-#     history HEAD~10 documents how to build it fresh).
-FROM leaderboard_worker_real:latest
+#   docker build -t aicapstone-sim:local -f aicapstone/Dockerfile aicapstone
+#   docker compose build          # this file; see docker-compose.yml
+#
+# Build context = this worker directory. The aicapstone checkout comes in
+# as the named context `aicapstone` (compose `additional_contexts`), e.g.
+#   docker build -f Dockerfile.real --build-context aicapstone=./aicapstone .
+#
+# Eval task configs are NOT baked in: the worker fetches the config for
+# each job from central (/api/workers/submissions/<id>/task-config), so
+# every school grades with the version central currently holds.
+#
+# Requires an NVIDIA driver on the host + nvidia-container-toolkit.
+ARG BASE_IMAGE=aicapstone-sim:local
+FROM ${BASE_IMAGE}
 
 # worker_agent's Python runtime deps — separate from the isaacsim
 # environment installed in the base image.
@@ -24,19 +31,12 @@ RUN pip install --no-cache-dir \
         "pydantic==2.9.0" \
         "pydantic-settings==2.5.0"
 
-# Copy worker_agent source — mounted over at runtime by docker-compose
-# so code edits don't require rebuild, but bake a copy for hermetic runs.
-# NOTE: build with `docker build -f worker_agent/Dockerfile.real .` so the
-# build context is the leaderboard repo root and both `worker_agent/` and
-# `private_tasks/` are visible.
-COPY worker_agent/ /app/worker_agent/
+# Worker source (.dockerignore keeps .env and the aicapstone checkout out).
+COPY . /app/worker_agent/
 
-# Bake the private task-config .py files into the image at /private_tasks
-# so remote workers using this image without any bind-mount can find them
-# at the default `--task=/private_tasks/{task_name}_eval.py` path. Also
-# copy into /workspace/aicapstone/private_tasks so both symlink paths
-# resolve the same content.
-COPY private_tasks/ /private_tasks/
+# The base image only installs packages/simulator; bake the rollout entry
+# point (and its policy sidecar) from the same pinned checkout.
+COPY --from=aicapstone scripts/ /workspace/aicapstone/scripts/
 
 # The base image inherits ENTRYPOINT from isaacsim/IsaacLab launchers
 # (`/isaac-sim/python.sh` in some layers). Override so the worker's
@@ -49,12 +49,9 @@ ENV PYTHONUNBUFFERED=1 \
     WORKER_PORT=8080
 RUN mkdir -p /var/lib/worker-agent/storage /var/lib/worker-agent/state
 
-# The base image installs the aicapstone tree at /workspace/aicapstone.
 # The worker's default `ISAAC_SIM_SCRIPT_PATH=/aicapstone/scripts/rollout.py`
-# assumes it's at /aicapstone (matches the LOCAL demo bind-mount layout).
-# Symlink so both paths resolve. NOT symlinking `/private_tasks` because
-# the COPY above baked real files there — schools that DON'T bind-mount
-# their own private_tasks pick up the baked copy.
+# assumes the tree at /aicapstone; the base image installs it under
+# /workspace/aicapstone.
 RUN ln -snf /workspace/aicapstone /aicapstone
 
 # Bake a pre-warmed Omniverse Kit cache captured from a `--validate_only`
@@ -63,7 +60,7 @@ RUN ln -snf /workspace/aicapstone /aicapstone
 # uncompressed / 4 MB tarball) because heavy USDs are already baked into
 # /workspace/aicapstone. Runtime writes to a mounted volume so this seed
 # only matters until the volume grows its own copy.
-COPY worker_agent/ov-cache.tgz /tmp/ov-cache.tgz
+COPY ov-cache.tgz /tmp/ov-cache.tgz
 RUN mkdir -p /root/.cache/ov \
  && tar xzf /tmp/ov-cache.tgz -C /root/.cache/ov \
  && rm /tmp/ov-cache.tgz

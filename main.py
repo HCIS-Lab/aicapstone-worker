@@ -119,9 +119,13 @@ def _handle_job(job: dict) -> None:
                 client.report_progress(sid, **kwargs)
             except Exception:
                 pass   # best-effort, do NOT slow the eval loop
+        # Eval configs are served by central per job instead of being
+        # baked into the image, so every school grades with the same
+        # version. None = older central; rollout falls back to /private_tasks.
+        task_config = client.get_task_config(sid) if cfg.eval_mode == "real" else None
         result = run_rollout(
             sid, job.get("task_name") or "", job.get("dataset") or "public",
-            on_progress=_on_progress,
+            on_progress=_on_progress, task_config=task_config,
         )
         log.info("rollout finished sid=%d status=%s rate=%s",
                  sid, result.status, result.success_rate)
@@ -161,6 +165,8 @@ def _handle_job(job: dict) -> None:
             edir = extracted_dir_for(sid)
             if edir.is_dir():
                 shutil.rmtree(edir, ignore_errors=True)
+            from worker_agent.rollout import task_config_dir_for
+            shutil.rmtree(task_config_dir_for(sid), ignore_errors=True)
         except Exception:
             pass
 

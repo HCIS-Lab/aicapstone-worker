@@ -189,6 +189,14 @@ case "$MODE" in
   *) die "EVAL_MODE must be 'mock' or 'real' (got '${MODE}')";;
 esac
 
+# Simulator source for the local real-mode build. Pin AICAPSTONE_REF to the
+# release HCIS-Lab announces (branch, tag or commit) so every school builds
+# the same simulator.
+AICAPSTONE_REPO_VAL="$(env_get AICAPSTONE_REPO)"
+AICAPSTONE_REPO_VAL="${AICAPSTONE_REPO_VAL:-https://github.com/HCIS-Lab/aicapstone.git}"
+AICAPSTONE_REF_VAL="$(env_get AICAPSTONE_REF)"
+AICAPSTONE_REF_VAL="${AICAPSTONE_REF_VAL:-feat/eval-rollout-fixes}"
+
 # ── GPU auto-selection ───────────────────────────────────────────────
 # Every worker container claims exactly one GPU. When the operator spins
 # up a SECOND worker on the same host we should hand it a different card
@@ -264,7 +272,7 @@ if [[ "$MODE" == "real" ]]; then
     ok "nvidia-smi present"
   fi
   if ! docker info 2>/dev/null | grep -qi 'nvidia'; then
-    warn "Docker doesn't seem to know about the nvidia runtime — install nvidia-container-toolkit"
+    die "Docker has no nvidia runtime — install nvidia-container-toolkit (or use --mode=mock for a GPU-less smoke test)"
   else
     ok "nvidia runtime available to docker"
   fi
@@ -375,6 +383,12 @@ ALLOWED_TASK_KEYS=cup_stacking,cutlery_arrangement,toy_block_collection
 # host (each in its own directory / port) don't collide.
 WORKER_CONTAINER_NAME=${CONTAINER_NAME}
 
+# Simulator source for the local real-mode build (re-run ./setup.sh after
+# changing AICAPSTONE_REF to rebuild on a new release).
+AICAPSTONE_REPO=${AICAPSTONE_REPO_VAL}
+AICAPSTONE_REF=${AICAPSTONE_REF_VAL}
+$( [[ "$MODE" == "mock" ]] && echo "COMPOSE_FILE=docker-compose.yml:docker-compose.mock.yml" )
+
 # Optional HuggingFace token — lerobot policies download weights on
 # first eval. Anonymous rate limit is ~10 req/hr per IP so parallel
 # evals easily hit 429; a read-scope token removes that limit.
@@ -386,8 +400,28 @@ EOF
 fi
 
 # ── 5. build + start ─────────────────────────────────────────────────
+if [[ "$MODE" == "real" ]]; then
+  hdr "Building simulator (aicapstone @ ${AICAPSTONE_REF_VAL})"
+  command -v git >/dev/null 2>&1 || die "git is required to fetch the simulator source"
+  if [[ ! -d aicapstone/.git ]]; then
+    git clone --filter=blob:none "$AICAPSTONE_REPO_VAL" aicapstone \
+      || die "could not clone ${AICAPSTONE_REPO_VAL}"
+  fi
+  git -C aicapstone fetch --quiet origin "$AICAPSTONE_REF_VAL" \
+    || die "could not fetch ${AICAPSTONE_REF_VAL} from ${AICAPSTONE_REPO_VAL}"
+  git -C aicapstone checkout --quiet --detach FETCH_HEAD
+  git -C aicapstone submodule update --init --recursive \
+    || die "could not fetch aicapstone submodules (IsaacLab)"
+  ok "aicapstone at $(git -C aicapstone rev-parse --short HEAD)"
+  # First build installs Isaac Sim (~30 GB, 30-60 min); later builds reuse
+  # cached layers and only redo what changed in the new release.
+  docker build -t aicapstone-sim:local -f aicapstone/Dockerfile aicapstone \
+    || die "simulator image build failed"
+fi
+
 hdr "Starting worker container"
-docker compose up -d --build
+docker compose build || die "worker image build failed"
+docker compose up -d
 echo
 
 # ── 6. wait for local /health ────────────────────────────────────────

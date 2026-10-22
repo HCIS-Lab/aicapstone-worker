@@ -184,6 +184,22 @@ class CentralClient:
             return None
         return data
 
+    # ── Eval task config ────────────────────────────────────────────
+    def get_task_config(self, submission_id: int) -> Optional[dict]:
+        """Fetch the eval config for an assigned submission:
+        `{task_name, filename, sha256, content}`. Returns None when central
+        is too old to serve it (404 on the route) so the caller can fall
+        back to a locally mounted /private_tasks; raises on other errors."""
+        r = self._client.get(
+            f"/api/workers/submissions/{submission_id}/task-config",
+            headers=self._auth_headers(),
+        )
+        if r.status_code == 404 and "no eval config" not in r.text:
+            return None
+        if r.status_code != 200:
+            raise CentralError(f"task-config {r.status_code}: {r.text[:200]}")
+        return r.json()
+
     # ── Progress (non-terminal) ─────────────────────────────────────
     def report_progress(
         self, submission_id: int, *,

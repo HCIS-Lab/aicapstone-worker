@@ -1,0 +1,9 @@
+# Secrets and local state never go into an image.
+.env
+.env.*
+!.env.example
+# The aicapstone checkout enters the build as a named context instead.
+aicapstone/
+__pycache__/
+*.pyc
+.git/
