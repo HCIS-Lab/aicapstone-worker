@@ -193,9 +193,9 @@ esac
 # release HCIS-Lab announces (branch, tag or commit) so every school builds
 # the same simulator.
 AICAPSTONE_REPO_VAL="$(env_get AICAPSTONE_REPO)"
-AICAPSTONE_REPO_VAL="${AICAPSTONE_REPO_VAL:-https://github.com/HCIS-Lab/aicapstone.git}"
+AICAPSTONE_REPO_VAL="${AICAPSTONE_REPO_VAL:-https://github.com/asddzxcc1856/aicapstone.git}"
 AICAPSTONE_REF_VAL="$(env_get AICAPSTONE_REF)"
-AICAPSTONE_REF_VAL="${AICAPSTONE_REF_VAL:-feat/eval-rollout-fixes}"
+AICAPSTONE_REF_VAL="${AICAPSTONE_REF_VAL:-feat/eval-rollout-fixes-nb}"
 
 # ── GPU auto-selection ───────────────────────────────────────────────
 # Every worker container claims exactly one GPU. When the operator spins

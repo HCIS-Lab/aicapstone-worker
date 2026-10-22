@@ -189,8 +189,8 @@ Or use the `publish-worker` Makefile target if the repo defines one.
 | `WORKER_PUBLIC_URL` | *(no default)* | External URL for `/upload` — must be reachable from student browsers |
 | `WORKER_HOST_PORT` | auto-picked | First free port in `8081..8181` |
 | `EVAL_MODE` | `real` | `mock` \| `real` |
-| `AICAPSTONE_REF` | `feat/eval-rollout-fixes` | Simulator release (branch / tag / commit) that `setup.sh` clones and builds locally. Eval task configs are not part of the build — the worker fetches them from central per job |
-| `AICAPSTONE_REPO` | `https://github.com/HCIS-Lab/aicapstone.git` | Simulator source repo |
+| `AICAPSTONE_REF` | `feat/eval-rollout-fixes-nb` | Simulator release (branch / tag / commit) that `setup.sh` clones and builds locally. Eval task configs are not part of the build — the worker fetches them from central per job |
+| `AICAPSTONE_REPO` | `https://github.com/asddzxcc1856/aicapstone.git` | Simulator source repo |
 | `ISAAC_SIM_SCRIPT_PATH` | `/aicapstone/scripts/rollout.py` | `real` mode only |
 | `WORKER_STORAGE_ROOT` | `/var/lib/worker-agent/storage` | Docker volume `worker_storage` |
 | `WORKER_STATE_DIR` | `/var/lib/worker-agent/state` | Docker volume `worker_state` |
