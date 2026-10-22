@@ -20,7 +20,9 @@ import logging
 import os
 import random
 import re
+import signal
 import subprocess
+import threading
 import time
 import uuid
 import zipfile
@@ -269,8 +271,23 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> R
         bufsize=1,                  # line-buffered
         start_new_session=True,
     )
-    timeout_at = started + int(os.getenv("EVAL_TIMEOUT_SEC", "10800"))
+    timeout_sec = int(os.getenv("EVAL_TIMEOUT_SEC", "10800"))
+    timeout_at = started + timeout_sec
     timed_out = False
+
+    def _kill_group(sig: int) -> None:
+        # `cmd` is `bash -c "...; python rollout.py ..."` in its own session,
+        # so signalling only `proc` leaves Isaac Sim running on the GPU.
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # Rollout can go many minutes without printing, so the line loop below
+    # can't be relied on to notice the deadline; kill from a timer instead.
+    watchdog = threading.Timer(timeout_sec, _kill_group, args=(signal.SIGKILL,))
+    watchdog.daemon = True
+    watchdog.start()
     try:
         assert proc.stdout is not None
         for raw in proc.stdout:
@@ -295,16 +312,16 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None) -> R
                 timed_out = True
                 break
     finally:
+        watchdog.cancel()
         if proc.poll() is None:
+            _kill_group(signal.SIGTERM)
             try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _kill_group(signal.SIGKILL)
     proc.wait()
+    if time.time() > timeout_at:
+        timed_out = True
     duration = time.time() - started
     stdout = "".join(stdout_chunks)
     combined = stdout.strip()
