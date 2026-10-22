@@ -119,47 +119,11 @@ missing.
 
 ## 4. Installation
 
-Two supported paths for getting this code onto the GPU host.
-
-### Option A — clone the standalone worker repo (recommended)
-
-Central maintainers publish this directory as its own repo at
-`https://github.com/HCIS-Lab/aicapstone-worker.git`. Schools only see
-the worker code, never the central plane.
+### Clone the standalone worker repo (recommended)
 
 ```bash
 git clone https://github.com/HCIS-Lab/aicapstone-worker.git worker-gpu0
 cd worker-gpu0
-./setup.sh
-```
-
-### Option B — sparse-checkout of the central repo
-
-If a second repo isn't wanted:
-
-```bash
-git clone --filter=blob:none --sparse https://github.com/HCIS-Lab/aicapstone-leaderboard.git
-cd aicapstone-leaderboard
-git sparse-checkout set worker_agent
-cd worker_agent
-./setup.sh
-```
-
-Downside: `git ls-tree` still reveals the full central file list.
-Prefer A.
-
-### Option C — tarball release (offline installs)
-
-For schools behind firewalls that can't reach GitHub:
-
-```bash
-# on the central side, release maintainer runs:
-tar czf aicapstone-worker-$(date +%Y%m%d).tgz -C worker_agent \
-  --exclude='__pycache__' --exclude='.env' --exclude='.env.*' .
-
-# school operator receives the tarball:
-mkdir aicapstone-worker && tar xzf aicapstone-worker-*.tgz -C aicapstone-worker
-cd aicapstone-worker
 ./setup.sh
 ```
 
@@ -171,8 +135,6 @@ git subtree split --prefix=worker_agent -b _worker-split
 git push -f git@github.com:HCIS-Lab/aicapstone-worker.git _worker-split:main
 git branch -D _worker-split
 ```
-
-Or use the `publish-worker` Makefile target if the repo defines one.
 
 ---
 
