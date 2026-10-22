@@ -126,6 +126,7 @@ def _handle_job(job: dict) -> None:
         result = run_rollout(
             sid, job.get("task_name") or "", job.get("dataset") or "public",
             on_progress=_on_progress, task_config=task_config,
+            eval_settings=job.get("eval_settings"),
         )
         log.info("rollout finished sid=%d status=%s rate=%s",
                  sid, result.status, result.success_rate)

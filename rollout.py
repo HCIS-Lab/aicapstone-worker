@@ -206,8 +206,18 @@ def _resolve_task_file(sid: int, task_name: str, task_config: Optional[dict]) ->
     return local if local.is_file() else None
 
 
+def _central_int(eval_settings: Optional[dict], key: str) -> Optional[int]:
+    """Admin Eval Settings value sent by central with the job, or None."""
+    try:
+        v = (eval_settings or {}).get(key)
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
-                  task_config: Optional[dict] = None) -> RolloutResult:
+                  task_config: Optional[dict] = None,
+                  eval_settings: Optional[dict] = None) -> RolloutResult:
     """Exec rollout.py against the extracted policy.
 
     Command shape matches the central `EVAL_CMD_TEMPLATE`:
@@ -244,8 +254,12 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
             ),
         )
     action_horizon = _resolve_action_horizon(policy_type, extracted)
-    eval_rounds = "50" if dataset == "public" else "100"
-    episode_length_s = os.getenv("EVAL_EPISODE_LENGTH_S", "").strip() or "60"
+    # Central's admin Eval Settings override the local .env so every school
+    # grades identically; the local values only apply with an older central.
+    eval_rounds = str(_central_int(eval_settings, "eval_rounds")
+                      or (50 if dataset == "public" else 100))
+    episode_length_s = str(_central_int(eval_settings, "episode_length_s")
+                           or os.getenv("EVAL_EPISODE_LENGTH_S", "").strip() or "60")
     device = os.getenv("EVAL_DEVICE", "").strip() or "cuda:0"
 
     nonce = uuid.uuid4().hex
@@ -300,8 +314,11 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
         bufsize=1,                  # line-buffered
         start_new_session=True,
     )
-    timeout_sec = int(os.getenv("EVAL_TIMEOUT_SEC", "10800"))
-    timeout_at = started + timeout_sec
+    # Admin value from central wins; 0 there means "no total-time limit".
+    timeout_sec = _central_int(eval_settings, "timeout_sec")
+    if timeout_sec is None:
+        timeout_sec = int(os.getenv("EVAL_TIMEOUT_SEC", "10800"))
+    timeout_at = started + timeout_sec if timeout_sec > 0 else float("inf")
     timed_out = False
 
     def _kill_group(sig: int) -> None:
@@ -316,7 +333,8 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
     # can't be relied on to notice the deadline; kill from a timer instead.
     watchdog = threading.Timer(timeout_sec, _kill_group, args=(signal.SIGKILL,))
     watchdog.daemon = True
-    watchdog.start()
+    if timeout_sec > 0:
+        watchdog.start()
     try:
         assert proc.stdout is not None
         for raw in proc.stdout:
@@ -402,7 +420,8 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
 
 
 def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
-                task_config: Optional[dict] = None) -> RolloutResult:
+                task_config: Optional[dict] = None,
+                eval_settings: Optional[dict] = None) -> RolloutResult:
     """Entry point called by the agent's job-poll loop after a
     successful `/next-job`. Extracts the zip then delegates to the
     appropriate backend.
@@ -429,4 +448,4 @@ def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
         log.info("[mock] rolling submission %d", sid)
         return _mock_rollout(sid, on_progress=on_progress)
     return _real_rollout(sid, task_name, dataset, on_progress=on_progress,
-                         task_config=task_config)
+                         task_config=task_config, eval_settings=eval_settings)

@@ -162,6 +162,11 @@ git branch -D _worker-split
 | `ALLOWED_TASK_KEYS` | *(empty = all)* | Restrict this worker to specific tasks |
 | `HF_TOKEN` | *(empty)* | Optional. HuggingFace read-scope token — removes the anonymous rate limit that lerobot policy weights hit on first eval. Get one at `https://huggingface.co/settings/tokens`. |
 
+**Evaluation parameters are set centrally.** Episodes per eval (public /
+private), episode length and total timeout come from the admin
+**Eval Settings** panel with every job and override `EVAL_EPISODE_LENGTH_S`
+/ `EVAL_TIMEOUT_SEC` in `.env`, so every school grades the same way.
+
 **To change any setting after install**: edit `.env`, then
 `docker compose restart`. Never edit files inside the running
 container — they're lost on restart.
