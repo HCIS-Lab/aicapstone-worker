@@ -273,7 +273,10 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
         f'--headless '
         f'--enable_cameras '
         f'--eval_rounds={eval_rounds} '
-        f'--episode_length_s={episode_length_s}'
+        f'--episode_length_s={episode_length_s} '
+        # Side-by-side wrist+front MP4 for admin replay; uploaded to central
+        # after the run (see main._handle_job).
+        f'--video_out={video_path_for(sid)}'
     )
     cmd = [
         "bash", "-c",

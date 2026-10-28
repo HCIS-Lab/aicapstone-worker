@@ -130,6 +130,17 @@ def _handle_job(job: dict) -> None:
         )
         log.info("rollout finished sid=%d status=%s rate=%s",
                  sid, result.status, result.success_rate)
+        # Push the replay before the result so it is already there when the
+        # submission flips to FINISHED. Best-effort: a failed upload must not
+        # lose the score, and the local file is kept for a later retry.
+        from worker_agent.storage import video_path_for
+        video = video_path_for(sid)
+        if video.is_file() and video.stat().st_size > 0:
+            try:
+                client.upload_video(sid, video)
+                video.unlink()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("video upload failed sid=%d: %s", sid, exc)
         client.report_result(
             sid,
             status=result.status,

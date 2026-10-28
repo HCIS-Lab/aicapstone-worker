@@ -200,6 +200,28 @@ class CentralClient:
             raise CentralError(f"task-config {r.status_code}: {r.text[:200]}")
         return r.json()
 
+    # ── Eval recording ──────────────────────────────────────────────
+    def upload_video(self, submission_id: int, path) -> None:
+        """Stream the rollout MP4 to central so admins can replay it.
+        Raises on failure; the caller keeps the local file in that case."""
+        size = path.stat().st_size
+
+        def _chunks():
+            with open(path, "rb") as f:
+                while chunk := f.read(1024 * 1024):
+                    yield chunk
+
+        r = self._client.post(
+            f"/api/workers/submissions/{submission_id}/video",
+            headers={**self._auth_headers(), "Content-Type": "video/mp4",
+                     "Content-Length": str(size)},
+            content=_chunks(),
+            timeout=httpx.Timeout(30.0, write=600.0),
+        )
+        if r.status_code != 200:
+            raise CentralError(f"video upload {r.status_code}: {r.text[:200]}")
+        log.info("uploaded eval video sid=%d (%d bytes)", submission_id, size)
+
     # ── Progress (non-terminal) ─────────────────────────────────────
     def report_progress(
         self, submission_id: int, *,
