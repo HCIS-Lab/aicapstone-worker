@@ -3,8 +3,10 @@
 Two things run at the same time:
 
   1. FastAPI HTTP server on `WORKER_PORT` (default 8080) — handles
-     `/upload/{token}` etc. from student browsers + central.
-  2. Background thread that runs heartbeat + job-poll loops.
+     `/upload/{token}` etc. from student browsers + central, or the
+     school's own UI in standalone mode.
+  2. Background threads: heartbeat + job-poll loops against central, or
+     the local run queue in standalone mode.
 
 Both are supervised by a single asyncio event loop so a hard crash in
 either brings down the container (docker/k8s restart policy kicks in).
@@ -259,19 +261,33 @@ _threads: list[threading.Thread] = []
 # followed by uvicorn re-importing the same module as "worker_agent.main")
 # fire `_startup` twice, doubling every background thread — heartbeat
 # lands twice per interval AND the job-poll loop grabs two submissions at
-# once. Keep this flag module-level so ANY startup path only spawns once.
-_startup_done = False
+# once. Both module copies register on the SAME `app` from server.py, so
+# the flag lives on the app; a module global would exist once per copy.
 
 
 @app.on_event("startup")
 def _startup():
-    global _startup_done
-    if _startup_done:
+    if getattr(app.state, "agent_started", False):
         log.info("startup already ran — skipping duplicate registration")
         return
-    _startup_done = True
+    app.state.agent_started = True
 
     cfg.check_or_die()
+    if cfg.standalone:
+        # No central: the local UI is the control plane, the local queue
+        # feeds the GPU.
+        from worker_agent import local_runner
+        from worker_agent.local_store import get_store
+        from worker_agent.local_ui import announce_password
+        get_store()
+        announce_password()
+        t = threading.Thread(target=local_runner.run_loop, args=(_stop_flag,),
+                             name="local_run_loop", daemon=True)
+        t.start()
+        _threads.append(t)
+        log.info("worker agent up on port %d (standalone, mode=%s) — open the UI at /",
+                 cfg.port, cfg.eval_mode)
+        return
     _bootstrap_auth()
     if _stop_flag.is_set():
         # bootstrap failed → don't spawn loops

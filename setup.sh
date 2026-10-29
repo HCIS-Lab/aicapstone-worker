@@ -3,8 +3,11 @@
 # AI Capstone Leaderboard — Worker Agent one-command installer
 #
 # Usage:
-#   ./setup.sh                              # interactive
-#   ./setup.sh --token=<JOIN_TOKEN> \       # non-interactive
+#   ./setup.sh                              # standalone (default): the school
+#                                           # runs evals from this worker's own
+#                                           # web UI, no central connection
+#   ./setup.sh --password=<UI_PASSWORD> --yes   # standalone, non-interactive
+#   ./setup.sh --token=<JOIN_TOKEN> \       # central mode (federated leaderboard)
 #              --public-url=https://gpu-01.school.edu.tw \
 #              --name=gpu-01 \
 #              --mode=real \
@@ -21,7 +24,8 @@
 #   1. Verifies docker + docker compose (+ nvidia if EVAL_MODE=real)
 #   2. Prompts for anything not passed as a flag / already in .env
 #   3. Writes .env, brings the container up
-#   4. Waits for /health locally + confirms registration at central
+#   4. Waits for /health locally (+ confirms registration at central in
+#      central mode, or prints the UI URL + login in standalone mode)
 #
 # Idempotent: rerun any time — reuses existing .env if all values are
 # present (unless --reset is passed).
@@ -48,6 +52,7 @@ hdr()  { printf '\n%s══ %s ══%s\n' "$BOLD" "$*" "$RST"; }
 # ── args ─────────────────────────────────────────────────────────────
 DEFAULT_CENTRAL_URL="https://hcislab.ddns.net"
 CLI_TOKEN=""; CLI_PUBLIC_URL=""; CLI_NAME=""; CLI_MODE=""; CLI_CENTRAL=""; CLI_HF_TOKEN=""
+CLI_WORKER_MODE=""; CLI_PASSWORD=""
 YES=0; RESET=0; STATUS_ONLY=0
 
 for arg in "$@"; do
@@ -58,11 +63,14 @@ for arg in "$@"; do
     --mode=*)        CLI_MODE="${arg#*=}" ;;
     --central=*)     CLI_CENTRAL="${arg#*=}" ;;
     --hf-token=*)    CLI_HF_TOKEN="${arg#*=}" ;;
+    --standalone)    CLI_WORKER_MODE=standalone ;;
+    --central)       CLI_WORKER_MODE=central ;;
+    --password=*)    CLI_PASSWORD="${arg#*=}" ;;
     --gpu-id=*)      : ;;  # consumed later so `pick_next_gpu` can still auto-detect
     --yes|-y)        YES=1 ;;
     --reset)         RESET=1 ;;
     --status)        STATUS_ONLY=1 ;;
-    --help|-h)       sed -n '2,25p' "$0"; exit 0 ;;
+    --help|-h)       sed -n '2,30p' "$0"; exit 0 ;;
     *) die "Unknown flag: $arg (use --help)";;
   esac
 done
@@ -126,6 +134,19 @@ PUBLIC_URL="${CLI_PUBLIC_URL:-$(env_get WORKER_PUBLIC_URL)}"
 WORKER_NAME="${CLI_NAME:-$(env_get WORKER_NAME)}"
 MODE="${CLI_MODE:-$(env_get EVAL_MODE)}"
 HF_TOKEN_VAL="${CLI_HF_TOKEN:-$(env_get HF_TOKEN)}"
+ADMIN_PASSWORD="${CLI_PASSWORD:-$(env_get WORKER_ADMIN_PASSWORD)}"
+
+# Standalone unless told otherwise: a join token (flag or existing .env)
+# means this worker belongs to the central leaderboard.
+WORKER_MODE_VAL="${CLI_WORKER_MODE:-$(env_get WORKER_MODE)}"
+if [[ -z "$WORKER_MODE_VAL" ]]; then
+  if [[ -n "$JOIN_TOKEN" ]]; then WORKER_MODE_VAL=central; else WORKER_MODE_VAL=standalone; fi
+fi
+case "$WORKER_MODE_VAL" in
+  standalone|central) ;;
+  *) die "WORKER_MODE must be 'standalone' or 'central' (got '${WORKER_MODE_VAL}')";;
+esac
+ok "worker mode: ${WORKER_MODE_VAL}"
 
 prompt() {
   # prompt VAR "label" "default"
@@ -143,11 +164,18 @@ prompt() {
   printf -v "$var" '%s' "$value"
 }
 
-# Central URL — production default is fine for most schools
-[[ -n "$CENTRAL_URL" ]] || prompt CENTRAL_URL "Central plane URL" "$DEFAULT_CENTRAL_URL"
-
 # Worker name — hostname is a sane default
 [[ -n "$WORKER_NAME" ]] || prompt WORKER_NAME "Worker name (shown in admin UI)" "$(hostname -s 2>/dev/null || hostname || echo gpu-node)"
+
+if [[ "$WORKER_MODE_VAL" == "standalone" ]]; then
+  # The school's own UI login. Blank → random, printed at the end.
+  if [[ -z "$ADMIN_PASSWORD" ]]; then
+    prompt ADMIN_PASSWORD "UI admin password (Enter = generate one)"
+    [[ -n "$ADMIN_PASSWORD" ]] || ADMIN_PASSWORD="$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | cut -c1-16)"
+  fi
+else
+# Central URL — production default is fine for most schools
+[[ -n "$CENTRAL_URL" ]] || prompt CENTRAL_URL "Central plane URL" "$DEFAULT_CENTRAL_URL"
 
 # Join token — cannot default; require it
 if [[ -z "$JOIN_TOKEN" ]]; then
@@ -167,6 +195,7 @@ if [[ -z "$PUBLIC_URL" ]]; then
   say "${DIM}Must include the port your reverse proxy / port-forward exposes.${RST}"
   prompt PUBLIC_URL "Worker public URL" "$guess"
 fi
+fi  # central mode
 
 # Mode — default 'real' since partner-school workers always want Isaac
 # Sim; flip to mock explicitly with `--mode=mock` for a smoke test.
@@ -346,7 +375,9 @@ if [[ -f .env && \
       "$PUBLIC_URL"  == "$(env_get WORKER_PUBLIC_URL)" && \
       "$WORKER_NAME" == "$(env_get WORKER_NAME)" && \
       "$MODE"        == "$(env_get EVAL_MODE)" && \
-      "$HF_TOKEN_VAL" == "$(env_get HF_TOKEN)" ]]; then
+      "$HF_TOKEN_VAL" == "$(env_get HF_TOKEN)" && \
+      "$WORKER_MODE_VAL" == "$(env_get WORKER_MODE)" && \
+      "$ADMIN_PASSWORD" == "$(env_get WORKER_ADMIN_PASSWORD)" ]]; then
   existing_matches=1
 fi
 
@@ -358,6 +389,10 @@ else
   TMP="$(mktemp .env.XXXXXX)"
   cat > "$TMP" <<EOF
 # Generated by setup.sh on $(date -Iseconds)
+# standalone = this worker's own UI runs everything; central = leaderboard worker
+WORKER_MODE=${WORKER_MODE_VAL}
+WORKER_ADMIN_PASSWORD=${ADMIN_PASSWORD}
+
 CENTRAL_API_URL=${CENTRAL_URL}
 WORKER_JOIN_TOKEN=${JOIN_TOKEN}
 WORKER_NAME=${WORKER_NAME}
@@ -441,6 +476,18 @@ for i in $(seq 1 30); do
 done
 
 # ── 7. confirm central sees us ───────────────────────────────────────
+if [[ "$WORKER_MODE_VAL" == "standalone" ]]; then
+  hdr "Done"
+  say "${GRN}Worker \"${WORKER_NAME}\" is up in standalone mode.${RST}"
+  say ""
+  say "Open the eval UI:  ${BOLD}http://$(hostname -I 2>/dev/null | awk '{print $1}'):${HOST_PORT}/${RST}"
+  say "Admin password:    ${BOLD}${ADMIN_PASSWORD}${RST}   (WORKER_ADMIN_PASSWORD in .env)"
+  say ""
+  say "Define tasks + eval settings there, then upload policy zips to evaluate."
+  say "  ${BLU}docker compose logs -f${RST}          tail live logs"
+  say "  ${BLU}./setup.sh --status${RST}             one-shot health snapshot"
+  exit 0
+fi
 hdr "Waiting for central registration"
 # We don't have a machine JWT locally so we can't ask central directly.
 # Instead we wait for the agent's own logs to say `registered as worker <id>`,

@@ -5,7 +5,10 @@ presigned URL like `https://gpu-01.school-x.tw/upload/<token>`. The
 agent verifies the token via `storage.redeem_token()` then commits the
 bytes to its own local disk.
 
-Endpoints:
+Standalone mode (WORKER_MODE=standalone) serves the school's own UI and
+API instead — see local_ui.py.
+
+Central-mode endpoints:
   * `POST /upload/{token}` — receive one submission's zip
   * `GET  /download/{token}` — serve a stored zip (or video) back
   * `GET  /health` — liveness probe for the school's monitoring
@@ -52,10 +55,18 @@ def create_app() -> FastAPI:
     def health() -> dict:
         return {
             "status": "ok",
+            "mode": cfg.worker_mode,
             "worker_id": client.worker_id,
             "authenticated": client.authenticated,
             "storage_root": str(cfg.storage_root),
         }
+
+    if cfg.standalone:
+        # The school's own UI replaces central; the presigned-token routes
+        # below would accept files for a central that isn't there.
+        from worker_agent.local_ui import build_router
+        app.include_router(build_router())
+        return app
 
     @app.post("/upload/{token}")
     async def upload_submission(

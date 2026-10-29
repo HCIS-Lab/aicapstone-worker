@@ -6,6 +6,15 @@ plane over long-poll, executes the Isaac Sim rollout locally, and
 reports results back. Student zip bytes never traverse the central
 plane — data locality is enforced by design.
 
+The worker runs in one of two modes:
+
+* **Standalone (default)** — no central, no join token. The worker serves
+  its own web UI where the school defines eval tasks, sets eval
+  parameters, uploads policy zips and watches results and videos. See
+  [Standalone mode](#standalone-mode).
+* **Central** — the federated leaderboard flow described in the rest of
+  this document. Selected automatically when a join token is given.
+
 Central URL defaults to **`https://hcislab.ddns.net/`** throughout this
 document; override with `CENTRAL_API_URL` in `.env` if your deployment
 lives elsewhere.
@@ -14,6 +23,7 @@ lives elsewhere.
 
 ## Table of contents
 
+- [Standalone mode](#standalone-mode)
 1. [Overview](#1-overview)
 2. [System Requirements](#2-system-requirements)
 3. [Prerequisites](#3-prerequisites)
@@ -24,6 +34,47 @@ lives elsewhere.
 8. [Project Structure](#8-project-structure)
 9. [Troubleshooting](#9-troubleshooting)
 10. [FAQ](#10-faq)
+
+---
+
+## Standalone mode
+
+Each school runs its own evaluations end to end; nothing talks to central.
+
+```bash
+git clone https://github.com/HCIS-Lab/aicapstone-worker.git && cd aicapstone-worker
+./setup.sh                      # builds the simulator + worker, asks for a UI password
+# or non-interactive:
+./setup.sh --password='choose-one' --yes
+```
+
+At the end `setup.sh` prints the UI address (`http://<host>:<WORKER_HOST_PORT>/`)
+and the admin password (`WORKER_ADMIN_PASSWORD` in `.env`; if empty, the
+worker generates one and logs it on start).
+
+What the UI controls — everything central decides in central mode:
+
+| Tab | What you can do |
+|---|---|
+| **Runs** | Upload a policy zip (same format as the leaderboard: `config.json`, `model.safetensors`, … at any depth), pick the task, optionally override episodes / episode length for this run; queue, live progress + log, cancel, re-run, delete, replay the recorded video |
+| **Tasks** | The three built-in simulator tasks (gym ids `HCIS-CupStacking-SingleArm-v0`, `HCIS-CutleryArrangement-SingleArm-v0`, `HCIS-ToyBlocksCollection-SingleArm-v0`) are pre-loaded. Add your own by pasting / uploading an eval config `.py` (anything `rollout.py --task=<file.py>` accepts) or another registered gym id; each task can set its own episodes and episode length |
+| **Settings** | Episodes per eval, episode length, total timeout (0 = none), device, action horizon override, video recording on/off |
+
+Precedence for a run: **run override > task override > Settings**.
+
+Runs execute one at a time on the worker's GPU. Tasks, settings and run
+history live in `worker_state` (`local.db`); zips, logs and videos in
+`worker_storage` under `local_runs/` — both survive `docker compose down`
+(not `down -v`).
+
+Switching an existing worker: set `WORKER_MODE=standalone` (or `central`)
+in `.env` and `docker compose up -d`. A worker whose `.env` has no
+`WORKER_MODE` stays in central mode if it has a join token or is already
+registered, otherwise starts standalone.
+
+Security: the UI is protected only by the admin password over plain HTTP.
+Keep the port on the campus network or put it behind an HTTPS reverse
+proxy.
 
 ---
 
@@ -145,6 +196,8 @@ git branch -D _worker-split
 
 | Var | Default | Notes |
 |---|---|---|
+| `WORKER_MODE` | `standalone` (`central` if a join token is set) | `standalone` = own UI, no central; `central` = leaderboard worker |
+| `WORKER_ADMIN_PASSWORD` | *(generated)* | Standalone UI login |
 | `CENTRAL_API_URL` | `https://hcislab.ddns.net` | Central FastAPI base URL |
 | `WORKER_JOIN_TOKEN` | *(required first boot)* | One-shot from central; after registration the machine JWT is cached and this can be removed |
 | `WORKER_NAME` | `$(hostname)` | Shown in admin **Workers** tab |
@@ -162,7 +215,7 @@ git branch -D _worker-split
 | `ALLOWED_TASK_KEYS` | *(empty = all)* | Restrict this worker to specific tasks |
 | `HF_TOKEN` | *(empty)* | Optional. HuggingFace read-scope token — removes the anonymous rate limit that lerobot policy weights hit on first eval. Get one at `https://huggingface.co/settings/tokens`. |
 
-**Evaluation parameters are set centrally.** Episodes per eval (public /
+**Central mode: evaluation parameters are set centrally.** Episodes per eval (public /
 private), episode length and total timeout come from the admin
 **Eval Settings** panel with every job and override `EVAL_EPISODE_LENGTH_S`
 / `EVAL_TIMEOUT_SEC` in `.env`, so every school grades the same way.
@@ -336,8 +389,12 @@ worker_agent/
 ├── Dockerfile             ← mock-mode image
 ├── Dockerfile.real        ← real-mode image (Isaac Sim + IsaacLab baked in)
 ├── requirements.txt
-├── main.py                ← agent entrypoint (heartbeat + poll loop)
+├── main.py                ← agent entrypoint (central loops, or the local run queue)
 ├── server.py              ← FastAPI service exposing /health /upload /video
+├── local_ui.py            ← standalone: UI + JSON API + login
+├── local_store.py         ← standalone: tasks / settings / runs (SQLite)
+├── local_runner.py        ← standalone: run queue → rollout
+├── ui/index.html          ← standalone: the web UI (no build step)
 ├── config.py              ← env-var parsing + validation
 ├── central_client.py      ← typed HTTP client for CENTRAL_API_URL
 └── rollout.py             ← eval driver (mock + real Popen streaming)
@@ -348,6 +405,7 @@ worker_agent/
 ```
 /var/lib/worker-agent/
 ├── storage/                       # WORKER_STORAGE_ROOT
+│   ├── local_runs/                 (standalone; same layout + run.log)
 │   ├── submissions/
 │   │   └── sid=<id>/
 │   │       ├── pretrained_model.zip
@@ -356,6 +414,8 @@ worker_agent/
 │   └── tokens/
 │       └── <token_hash>.json
 └── state/                          # WORKER_STATE_DIR
+    ├── local.db                    # standalone tasks / settings / runs
+    ├── admin_password              # standalone, only if generated
     ├── machine_jwt                 # cached long-lived JWT
     └── worker_id                   # our numeric worker id
 ```

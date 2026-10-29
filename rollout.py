@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import signal
 import subprocess
 import threading
@@ -184,26 +185,39 @@ def _resolve_action_horizon(policy_type: str, extracted: Path) -> int:
     return _ACTION_HORIZON_DEFAULTS.get(policy_type, 1)
 
 
+def _checkpoint_root(extracted: Path) -> Path:
+    """Directory holding config.json. Zips are accepted with the policy
+    files nested in a folder (e.g. pretrained_model/), so look below the
+    extraction root and take the shallowest match."""
+    if (extracted / "config.json").is_file():
+        return extracted
+    hits = sorted(extracted.rglob("config.json"), key=lambda p: len(p.parts))
+    return hits[0].parent if hits else extracted
+
+
 def task_config_dir_for(sid: int) -> Path:
     # Own directory, NOT inside extracted/: rollout.py puts the config's
     # parent on sys.path, which must never contain student files.
     return submission_dir(sid) / "task_config"
 
 
-def _resolve_task_file(sid: int, task_name: str, task_config: Optional[dict]) -> Optional[Path]:
-    """Write the centrally served eval config to disk, or fall back to a
-    locally mounted /private_tasks (older central / single-host dev)."""
+def _resolve_task_file(sid: int, task_name: str, task_config: Optional[dict]) -> Optional[str]:
+    """Write the served eval config to disk, or fall back to a locally
+    mounted /private_tasks (older central / single-host dev). A
+    `gym_id` (standalone built-in task) is passed to rollout.py as is."""
+    if task_config and task_config.get("gym_id"):
+        return task_config["gym_id"]
     if task_config and task_config.get("content"):
         d = task_config_dir_for(sid)
         d.mkdir(parents=True, exist_ok=True)
         f = d / f"{task_name}_eval.py"
         f.write_text(task_config["content"], encoding="utf-8")
         f.chmod(0o600)
-        log.info("task config %s from central (sha256 %s)",
+        log.info("task config %s (sha256 %s)",
                  task_config.get("filename"), str(task_config.get("sha256", ""))[:12])
-        return f
+        return str(f)
     local = Path(f"/private_tasks/{task_name}_eval.py")
-    return local if local.is_file() else None
+    return str(local) if local.is_file() else None
 
 
 def _central_int(eval_settings: Optional[dict], key: str) -> Optional[int]:
@@ -217,7 +231,8 @@ def _central_int(eval_settings: Optional[dict], key: str) -> Optional[int]:
 
 def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
                   task_config: Optional[dict] = None,
-                  eval_settings: Optional[dict] = None) -> RolloutResult:
+                  eval_settings: Optional[dict] = None,
+                  cancel_event: Optional[threading.Event] = None) -> RolloutResult:
     """Exec rollout.py against the extracted policy.
 
     Command shape matches the central `EVAL_CMD_TEMPLATE`:
@@ -235,12 +250,12 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
             status="FAILED",
             error_message=f"rollout script not found at {script}",
         )
-    extracted = extracted_dir_for(sid)
+    extracted = _checkpoint_root(extracted_dir_for(sid))
     task_file = _resolve_task_file(sid, task_name, task_config)
     if task_file is None:
         return RolloutResult(
             status="FAILED",
-            error_message=f"no eval config for task '{task_name}' (central did not serve one)",
+            error_message=f"no eval config for task '{task_name}'",
         )
 
     policy_type = _detect_policy_type(extracted)
@@ -254,30 +269,39 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
             ),
         )
     action_horizon = _resolve_action_horizon(policy_type, extracted)
-    # Central's admin Eval Settings override the local .env so every school
-    # grades identically; the local values only apply with an older central.
+    # `eval_settings` is central's admin Eval Settings (so every school
+    # grades identically) or, standalone, the school's own UI settings.
+    # The .env values only apply when neither sends one.
     eval_rounds = str(_central_int(eval_settings, "eval_rounds")
                       or (50 if dataset == "public" else 100))
-    episode_length_s = str(_central_int(eval_settings, "episode_length_s")
-                           or os.getenv("EVAL_EPISODE_LENGTH_S", "").strip() or "60")
-    device = os.getenv("EVAL_DEVICE", "").strip() or "cuda:0"
+    try:
+        episode_length_s = float((eval_settings or {}).get("episode_length_s") or 0)
+    except (TypeError, ValueError):
+        episode_length_s = 0
+    episode_length_s = episode_length_s or float(os.getenv("EVAL_EPISODE_LENGTH_S", "").strip() or 60)
+    action_horizon = _central_int(eval_settings, "action_horizon") or action_horizon
+    device = ((eval_settings or {}).get("device") or os.getenv("EVAL_DEVICE", "").strip()
+              or "cuda:0")
+    record_video = (eval_settings or {}).get("record_video", True)
 
     nonce = uuid.uuid4().hex
+    q = shlex.quote  # policy_type comes from the student's config.json
     inner_cmd = (
-        f'python {script} '
-        f'--task={task_file} '
-        f'--policy_type={policy_type} '
-        f'--policy_checkpoint_path={extracted} '
-        f'--policy_action_horizon={action_horizon} '
-        f'--device={device} '
+        f'python {q(str(script))} '
+        f'--task={q(task_file)} '
+        f'--policy_type={q(policy_type)} '
+        f'--policy_checkpoint_path={q(str(extracted))} '
+        f'--policy_action_horizon={int(action_horizon)} '
+        f'--device={q(str(device))} '
         f'--headless '
         f'--enable_cameras '
-        f'--eval_rounds={eval_rounds} '
-        f'--episode_length_s={episode_length_s} '
-        # Side-by-side wrist+front MP4 for admin replay; uploaded to central
-        # after the run (see main._handle_job).
-        f'--video_out={video_path_for(sid)}'
+        f'--eval_rounds={int(eval_rounds)} '
+        f'--episode_length_s={episode_length_s:g} '
     )
+    if record_video:
+        # Side-by-side wrist+front MP4 for replay; central mode uploads it
+        # after the run (main._handle_job), standalone serves it locally.
+        inner_cmd += f'--video_out={q(str(video_path_for(sid)))}'
     cmd = [
         "bash", "-c",
         f'echo "LB-START-{nonce}"; '
@@ -338,6 +362,14 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
     watchdog.daemon = True
     if timeout_sec > 0:
         watchdog.start()
+
+    def _watch_cancel() -> None:
+        while proc.poll() is None:
+            if cancel_event.wait(1.0):
+                _kill_group(signal.SIGKILL)
+                return
+    if cancel_event is not None:
+        threading.Thread(target=_watch_cancel, daemon=True).start()
     try:
         assert proc.stdout is not None
         for raw in proc.stdout:
@@ -375,6 +407,14 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
     duration = time.time() - started
     stdout = "".join(stdout_chunks)
     combined = stdout.strip()
+    if cancel_event is not None and cancel_event.is_set():
+        return RolloutResult(
+            status="FAILED",
+            error_message="cancelled",
+            error_log=combined[-8192:],
+            duration_sec=duration,
+            detected_policy_type=policy_type,
+        )
     if timed_out:
         return RolloutResult(
             status="FAILED",
@@ -424,7 +464,8 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
 
 def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
                 task_config: Optional[dict] = None,
-                eval_settings: Optional[dict] = None) -> RolloutResult:
+                eval_settings: Optional[dict] = None,
+                cancel_event: Optional[threading.Event] = None) -> RolloutResult:
     """Entry point called by the agent's job-poll loop after a
     successful `/next-job`. Extracts the zip then delegates to the
     appropriate backend.
@@ -451,4 +492,5 @@ def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
         log.info("[mock] rolling submission %d", sid)
         return _mock_rollout(sid, on_progress=on_progress)
     return _real_rollout(sid, task_name, dataset, on_progress=on_progress,
-                         task_config=task_config, eval_settings=eval_settings)
+                         task_config=task_config, eval_settings=eval_settings,
+                         cancel_event=cancel_event)

@@ -95,6 +95,26 @@ class WorkerConfig:
             k.strip() for k in os.getenv("ALLOWED_TASK_KEYS", "").split(",") if k.strip()
         ]
 
+        # ── Operating mode ────────────────────────────────────────────
+        # `standalone` = the school runs everything from this worker's own
+        # web UI (tasks, eval settings, policy uploads, results, videos);
+        # nothing talks to central. `central` = the federated leaderboard
+        # flow (register with a join token, poll central for jobs).
+        # Unset: central only if this worker was already set up for it, so
+        # existing deployments keep their behaviour.
+        mode = os.getenv("WORKER_MODE", "").strip().lower()
+        if not mode:
+            joined = self.join_token or (self.state_dir / "machine_jwt").is_file()
+            mode = "central" if joined else "standalone"
+        self.worker_mode: str = mode
+        # Login for the standalone UI. Empty → generated on first boot and
+        # stored in STATE_DIR/admin_password (see local_ui._admin_password).
+        self.admin_password: Optional[str] = os.getenv("WORKER_ADMIN_PASSWORD") or None
+
+    @property
+    def standalone(self) -> bool:
+        return self.worker_mode == "standalone"
+
     def as_capabilities(self) -> dict:
         """The `capabilities` JSON dict we advertise at register time."""
         return {
@@ -114,7 +134,11 @@ class WorkerConfig:
         """Fail-fast validation identical in spirit to backend/app/config.py
         SECRET_KEY validator — bad config exits immediately so ops sees
         the problem instead of an agent that "works" but never registers."""
-        if not self.central_api_url:
+        if self.worker_mode not in ("standalone", "central"):
+            print(f"FATAL: WORKER_MODE must be 'standalone' or 'central' (got {self.worker_mode!r})",
+                  file=sys.stderr)
+            sys.exit(1)
+        if not self.standalone and not self.central_api_url:
             print("FATAL: CENTRAL_API_URL is not set", file=sys.stderr)
             sys.exit(1)
         try:

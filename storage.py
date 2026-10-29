@@ -48,7 +48,10 @@ def _hash(raw: str) -> str:
 
 
 def submission_dir(sid: int) -> Path:
-    d = cfg.storage_root / "submissions" / f"sid={sid}"
+    # Standalone run ids are local and would collide with central
+    # submission ids if a worker ever switches mode, so keep them apart.
+    sub = "local_runs" if cfg.standalone else "submissions"
+    d = cfg.storage_root / sub / f"sid={sid}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
