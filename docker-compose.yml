@@ -1,55 +1,33 @@
-# Reference docker-compose for deploying a Worker Agent at a partner school.
+# Eval worker for one GPU. Preferred entry point: `./setup.sh` (writes
+# .env, builds the image on this machine, brings the container up).
+# Manual path: copy .env.example → .env, edit, then `docker compose up -d --build`.
 #
-# Preferred entry point: `./setup.sh` (writes .env + brings the container up).
-# Manual path: copy .env.example → .env, edit, then `docker compose up -d`.
-#
-# Default is `real` mode, built on this machine: setup.sh clones the
-# pinned aicapstone checkout (AICAPSTONE_REF), builds the simulator base
-# image `aicapstone-sim:local` from it, then builds this service from
-# Dockerfile.real. Eval task configs are fetched from central per job.
-# For a GPU-less smoke test, setup.sh --mode=mock layers
-# docker-compose.mock.yml on top (via COMPOSE_FILE in .env).
-#
-# Update to a new release: set AICAPSTONE_REF in .env, re-run ./setup.sh
+# The image is built from this directory alone (Dockerfile.real): the
+# simulator source is in sim/. For a GPU-less UI test, setup.sh --mode=mock
+# layers docker-compose.mock.yml on top (via COMPOSE_FILE in .env).
 
 services:
   worker-agent:
     build:
       context: .
       dockerfile: Dockerfile.real
-      additional_contexts:
-        aicapstone: ${AICAPSTONE_DIR:-./aicapstone}
-      args:
-        BASE_IMAGE: aicapstone-sim:local
     image: aicapstone-worker-real:local
     pull_policy: build
-    # Container name is derived from the host port by setup.sh so
-    # multiple worker clones on the same host each get a unique name
-    # (worker-agent-8081, worker-agent-8082, ...). Without this the
-    # second `docker compose up` errors with "name is already in use".
+    # Derived from the host port by setup.sh so several workers on one host
+    # (one per GPU, each in its own clone) get unique names.
     container_name: ${WORKER_CONTAINER_NAME:-worker-agent}
     restart: unless-stopped
     ports:
-      # setup.sh walks 8081..8181 to find the first free port; central
-      # hands out WORKER_PUBLIC_URL/upload/<token> to student browsers,
-      # so each worker on a shared host must expose its OWN port.
+      # The UI. setup.sh picks the first free port in 8081..8181.
       - "${WORKER_HOST_PORT:-8081}:8080"
     env_file: .env
-    # Needed so the worker container can reach the central backend at
-    # http://host.docker.internal:8001 (dev-machine setup). In a real
-    # multi-host deploy you'd point CENTRAL_API_URL at a public hostname
-    # and this extra_hosts line is unnecessary.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
+      # Policy zips, logs, videos.
       - worker_storage:/var/lib/worker-agent/storage
+      # Tasks, settings, run history (local.db).
       - worker_state:/var/lib/worker-agent/state
-      # Omniverse asset cache — Isaac Sim writes here whenever it
-      # resolves a USD from S3. Multi-GB and slow to warm; this volume
-      # keeps it across container recreations so re-runs start in
-      # seconds instead of minutes. Safe to mount even in mock mode
-      # (nothing writes to it). Under `docker compose down -v` this
-      # volume is wiped, forcing the next real eval to re-download.
+      # Omniverse asset cache — multi-GB and slow to warm; kept across
+      # container recreations. `docker compose down -v` wipes it.
       - worker_ov_cache:/root/.cache/ov
     # One GPU per worker; setup.sh picks a free GPU_ID.
     runtime: nvidia
@@ -65,5 +43,4 @@ services:
 volumes:
   worker_storage:
   worker_state:
-  # Persistent Omniverse asset cache (see mount comment above).
   worker_ov_cache:

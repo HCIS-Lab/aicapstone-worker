@@ -1,18 +1,13 @@
-"""Executes one submission's evaluation.
+"""Executes one run's evaluation.
 
 Two modes:
 
   * `EVAL_MODE=mock`   — no GPU needed; returns a random success rate
                           after a short sleep. Useful for smoke-testing
-                          the agent ⇄ central protocol.
+                          the UI and queue.
   * `EVAL_MODE=real`   — spawns `python <ISAAC_SIM_SCRIPT_PATH> ...`
-                          with the same anti-cheat guards as the
-                          in-tree Celery worker (nonce framing,
-                          `start_new_session=True`).
-
-The real path is a subset of what backend/app/worker/tasks.py's
-`_evaluate` does — it doesn't yet handle multi-config plans or video
-recording. Extend as needed for the school's deployment.
+                          (sim/scripts/rollout.py) with nonce-framed
+                          output and `start_new_session=True`.
 """
 from __future__ import annotations
 
@@ -53,8 +48,7 @@ class RolloutResult:
 
 def _extract_zip(sid: int) -> Path:
     """Unzip the durable copy under storage/submissions/sid=N/extracted/.
-    Refuses zip-slip and symlink entries; matches the central-side
-    guard in backend/app/routers/submissions.py::_validate_zip_structure.
+    Refuses zip-slip and symlink entries.
     """
     z = zip_path_for(sid)
     target = extracted_dir_for(sid)
@@ -124,9 +118,7 @@ _FINAL_RE = re.compile(
 )
 
 
-# Per-policy defaults for --policy_action_horizon; must match the
-# central-side `ACTION_HORIZON_DEFAULTS` in
-# backend/app/evaluation/evaluator.py.
+# Per-policy defaults for --policy_action_horizon.
 _ACTION_HORIZON_DEFAULTS = {
     "lerobot-diffusion": 8, "smolvla": 8, "groot": 8, "XVLA": 8,
     "multi_task_dit": 8, "wall_x": 8,
@@ -141,9 +133,7 @@ def _detect_policy_type(extracted: Path) -> Optional[str]:
       1. config.json → `policy_type` / `type` / `model_type` / `policy`
       2. train_config.json → same keys
       3. None (caller decides how to bail)
-    Kept small on purpose — the full tokenizer + path-heuristic mess
-    lives in the central evaluator; this fallback covers the ~90 % case
-    where the trainer writes the type explicitly.
+    Covers the common case where the trainer writes the type explicitly.
     """
     import json as _json
     keys = ("policy_type", "type", "model_type", "policy", "name")
@@ -201,44 +191,40 @@ def task_config_dir_for(sid: int) -> Path:
     return submission_dir(sid) / "task_config"
 
 
-def _resolve_task_file(sid: int, task_name: str, task_config: Optional[dict]) -> Optional[str]:
-    """Write the served eval config to disk, or fall back to a locally
-    mounted /private_tasks (older central / single-host dev). A
-    `gym_id` (standalone built-in task) is passed to rollout.py as is."""
-    if task_config and task_config.get("gym_id"):
+def _resolve_task_file(sid: int, task_name: str, task_config: dict) -> Optional[str]:
+    """`--task` value for rollout.py: a built-in gym id as is, or the
+    task's eval config written into the run directory."""
+    if task_config.get("gym_id"):
         return task_config["gym_id"]
-    if task_config and task_config.get("content"):
-        d = task_config_dir_for(sid)
-        d.mkdir(parents=True, exist_ok=True)
-        f = d / f"{task_name}_eval.py"
-        f.write_text(task_config["content"], encoding="utf-8")
-        f.chmod(0o600)
-        log.info("task config %s (sha256 %s)",
-                 task_config.get("filename"), str(task_config.get("sha256", ""))[:12])
-        return str(f)
-    local = Path(f"/private_tasks/{task_name}_eval.py")
-    return str(local) if local.is_file() else None
+    if not task_config.get("content"):
+        return None
+    d = task_config_dir_for(sid)
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{task_name}_eval.py"
+    f.write_text(task_config["content"], encoding="utf-8")
+    f.chmod(0o600)
+    log.info("task config %s (sha256 %s)",
+             task_config.get("filename"), str(task_config.get("sha256", ""))[:12])
+    return str(f)
 
 
-def _central_int(eval_settings: Optional[dict], key: str) -> Optional[int]:
-    """Admin Eval Settings value sent by central with the job, or None."""
+def _setting_int(settings: dict, key: str) -> Optional[int]:
     try:
-        v = (eval_settings or {}).get(key)
-        return int(v) if v is not None else None
+        v = settings.get(key)
+        return int(v) if v not in (None, "") else None
     except (TypeError, ValueError):
         return None
 
 
-def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
-                  task_config: Optional[dict] = None,
-                  eval_settings: Optional[dict] = None,
+def _real_rollout(sid: int, task_name: str, task_config: dict, settings: dict,
+                  on_progress=None,
                   cancel_event: Optional[threading.Event] = None) -> RolloutResult:
     """Exec rollout.py against the extracted policy.
 
-    Command shape matches the central `EVAL_CMD_TEMPLATE`:
+    Command shape:
       python <script> --task=... --policy_type=... --policy_checkpoint_path=...
                       --policy_action_horizon=N --device=cuda:0 --headless
-                      --enable_cameras --eval_rounds=50|100 --episode_length_s=N
+                      --enable_cameras --eval_rounds=N --episode_length_s=N
                       --video_out=<path>
 
     Output is nonce-framed so import-time `print()` from the student's
@@ -269,20 +255,15 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
             ),
         )
     action_horizon = _resolve_action_horizon(policy_type, extracted)
-    # `eval_settings` is central's admin Eval Settings (so every school
-    # grades identically) or, standalone, the school's own UI settings.
-    # The .env values only apply when neither sends one.
-    eval_rounds = str(_central_int(eval_settings, "eval_rounds")
-                      or (50 if dataset == "public" else 100))
+    # `settings` = the UI's Settings, already merged with task / run overrides.
+    eval_rounds = _setting_int(settings, "eval_rounds") or 50
     try:
-        episode_length_s = float((eval_settings or {}).get("episode_length_s") or 0)
+        episode_length_s = float(settings.get("episode_length_s") or 60)
     except (TypeError, ValueError):
-        episode_length_s = 0
-    episode_length_s = episode_length_s or float(os.getenv("EVAL_EPISODE_LENGTH_S", "").strip() or 60)
-    action_horizon = _central_int(eval_settings, "action_horizon") or action_horizon
-    device = ((eval_settings or {}).get("device") or os.getenv("EVAL_DEVICE", "").strip()
-              or "cuda:0")
-    record_video = (eval_settings or {}).get("record_video", True)
+        episode_length_s = 60.0
+    action_horizon = _setting_int(settings, "action_horizon") or action_horizon
+    device = settings.get("device") or "cuda:0"
+    record_video = settings.get("record_video", True)
 
     nonce = uuid.uuid4().hex
     q = shlex.quote  # policy_type comes from the student's config.json
@@ -299,8 +280,7 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
         f'--episode_length_s={episode_length_s:g} '
     )
     if record_video:
-        # Side-by-side wrist+front MP4 for replay; central mode uploads it
-        # after the run (main._handle_job), standalone serves it locally.
+        # Side-by-side wrist+front MP4, replayed from the UI.
         inner_cmd += f'--video_out={q(str(video_path_for(sid)))}'
     cmd = [
         "bash", "-c",
@@ -341,10 +321,10 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
         bufsize=1,                  # line-buffered
         start_new_session=True,
     )
-    # Admin value from central wins; 0 there means "no total-time limit".
-    timeout_sec = _central_int(eval_settings, "timeout_sec")
+    # 0 means "no total-time limit".
+    timeout_sec = _setting_int(settings, "timeout_sec")
     if timeout_sec is None:
-        timeout_sec = int(os.getenv("EVAL_TIMEOUT_SEC", "10800"))
+        timeout_sec = 10800
     timeout_at = started + timeout_sec if timeout_sec > 0 else float("inf")
     timed_out = False
 
@@ -462,19 +442,14 @@ def _real_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
     )
 
 
-def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
-                task_config: Optional[dict] = None,
-                eval_settings: Optional[dict] = None,
+def run_rollout(sid: int, task_name: str, task_config: dict, settings: dict,
+                on_progress=None,
                 cancel_event: Optional[threading.Event] = None) -> RolloutResult:
-    """Entry point called by the agent's job-poll loop after a
-    successful `/next-job`. Extracts the zip then delegates to the
-    appropriate backend.
+    """Entry point called by local_runner for one queued run. Extracts the
+    zip then delegates to the mock or real backend.
 
-    `on_progress(**kwargs)` — if provided, called with the same fields
-    accepted by CentralClient.report_progress. Currently wired for mock
-    mode; real mode's subprocess still finalises before we hear anything,
-    so per-episode progress requires the sim script to emit episode
-    markers we can grep. (See _real_rollout — extension point.)
+    `on_progress(**kwargs)` — optional; receives `phase`, `episode`,
+    `episode_total` and `message` (one log line) as the run advances.
     """
     if not zip_path_for(sid).is_file():
         return RolloutResult(
@@ -489,8 +464,7 @@ def run_rollout(sid: int, task_name: str, dataset: str, on_progress=None,
             error_message=f"zip extract failed: {exc}",
         )
     if cfg.eval_mode == "mock":
-        log.info("[mock] rolling submission %d", sid)
+        log.info("[mock] rolling run %d", sid)
         return _mock_rollout(sid, on_progress=on_progress)
-    return _real_rollout(sid, task_name, dataset, on_progress=on_progress,
-                         task_config=task_config, eval_settings=eval_settings,
-                         cancel_event=cancel_event)
+    return _real_rollout(sid, task_name, task_config, settings,
+                         on_progress=on_progress, cancel_event=cancel_event)

@@ -1,8 +1,6 @@
-"""Standalone-mode job loop: the local counterpart of main.job_poll_loop.
-
-Takes QUEUED runs from the local store one at a time (one GPU per
-worker), runs them through the same rollout code central jobs use, and
-records progress, the log and the result locally.
+"""Run queue: takes QUEUED runs from the local store one at a time (one
+GPU per worker), runs them through rollout.py, and records progress, the
+log and the result.
 """
 from __future__ import annotations
 
@@ -76,9 +74,8 @@ def _run_one(run: dict) -> None:
 
     try:
         result = run_rollout(
-            rid, task["name"], "local", on_progress=_on_progress,
-            task_config=_task_config(task),
-            eval_settings=settings, cancel_event=_cancel,
+            rid, task["name"], _task_config(task), settings,
+            on_progress=_on_progress, cancel_event=_cancel,
         )
         if result.error_log:
             logf.write("\n── tail ──\n" + result.error_log + "\n")

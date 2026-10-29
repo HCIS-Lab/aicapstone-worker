@@ -1,9 +1,8 @@
-"""Standalone-mode persistence: tasks, eval settings and runs.
+"""Persistence: tasks, eval settings and runs.
 
-A school running the worker without central owns everything central
-would otherwise decide — which tasks exist, how many episodes, how long
-each episode lasts — so it lives here in one SQLite file under
-WORKER_STATE_DIR (survives container recreation via the state volume).
+The school decides which tasks exist, how many episodes, how long each
+episode lasts; it all lives in one SQLite file under WORKER_STATE_DIR
+(survives container recreation via the state volume).
 
 Effective settings for a run resolve as: run override > task override >
 global settings > DEFAULT_SETTINGS.

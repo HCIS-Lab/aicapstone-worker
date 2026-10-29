@@ -2,7 +2,7 @@
 .env
 .env.*
 !.env.example
-# The aicapstone checkout enters the build as a named context instead.
+# Left over from older setups that cloned the simulator here.
 aicapstone/
 __pycache__/
 *.pyc

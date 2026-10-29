@@ -1,34 +1,27 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-# AI Capstone Leaderboard — Worker Agent one-command installer
+# Eval Worker — one-command installer
 #
 # Usage:
-#   ./setup.sh                              # standalone (default): the school
-#                                           # runs evals from this worker's own
-#                                           # web UI, no central connection
-#   ./setup.sh --password=<UI_PASSWORD> --yes   # standalone, non-interactive
-#   ./setup.sh --token=<JOIN_TOKEN> \       # central mode (federated leaderboard)
-#              --public-url=https://gpu-01.school.edu.tw \
+#   ./setup.sh                              # interactive
+#   ./setup.sh --password=<UI_PASSWORD> \   # non-interactive
 #              --name=gpu-01 \
-#              --mode=real \
+#              --mode=real \                # real (default) | mock
 #              --gpu-id=1 \                 # optional; auto-selected if omitted
+#              --hf-token=<HF_TOKEN> \      # optional
 #              --yes
-#   ./setup.sh --reset                      # wipe state + prompt again
+#   ./setup.sh --reset                      # wipe everything + prompt again
 #   ./setup.sh --status                     # show current status
-#
-# GPU selection: in real mode we scan the host's nvidia-smi + other
-# worker-agent containers and pick the lowest-numbered card that isn't
-# already claimed. Pass --gpu-id=N to override.
 #
 # What it does:
 #   1. Verifies docker + docker compose (+ nvidia if EVAL_MODE=real)
 #   2. Prompts for anything not passed as a flag / already in .env
-#   3. Writes .env, brings the container up
-#   4. Waits for /health locally (+ confirms registration at central in
-#      central mode, or prints the UI URL + login in standalone mode)
+#   3. Writes .env, builds the image on this machine (Isaac Sim +
+#      simulator from sim/ + worker; first build 30-60 min), starts it
+#   4. Waits for /health and prints the UI address + password
 #
-# Idempotent: rerun any time — reuses existing .env if all values are
-# present (unless --reset is passed).
+# Idempotent: rerun any time (e.g. after `git pull`) — reuses .env and
+# rebuilds only what changed. --reset starts over.
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -50,34 +43,27 @@ die()  { printf '%s✗ %s%s\n' "$RED" "$*" "$RST" >&2; exit 1; }
 hdr()  { printf '\n%s══ %s ══%s\n' "$BOLD" "$*" "$RST"; }
 
 # ── args ─────────────────────────────────────────────────────────────
-DEFAULT_CENTRAL_URL="https://hcislab.ddns.net"
-CLI_TOKEN=""; CLI_PUBLIC_URL=""; CLI_NAME=""; CLI_MODE=""; CLI_CENTRAL=""; CLI_HF_TOKEN=""
-CLI_WORKER_MODE=""; CLI_PASSWORD=""
+CLI_NAME=""; CLI_MODE=""; CLI_HF_TOKEN=""; CLI_PASSWORD=""
 YES=0; RESET=0; STATUS_ONLY=0
 
 for arg in "$@"; do
   case "$arg" in
-    --token=*)       CLI_TOKEN="${arg#*=}" ;;
-    --public-url=*)  CLI_PUBLIC_URL="${arg#*=}" ;;
     --name=*)        CLI_NAME="${arg#*=}" ;;
     --mode=*)        CLI_MODE="${arg#*=}" ;;
-    --central=*)     CLI_CENTRAL="${arg#*=}" ;;
-    --hf-token=*)    CLI_HF_TOKEN="${arg#*=}" ;;
-    --standalone)    CLI_WORKER_MODE=standalone ;;
-    --central)       CLI_WORKER_MODE=central ;;
     --password=*)    CLI_PASSWORD="${arg#*=}" ;;
+    --hf-token=*)    CLI_HF_TOKEN="${arg#*=}" ;;
     --gpu-id=*)      : ;;  # consumed later so `pick_next_gpu` can still auto-detect
     --yes|-y)        YES=1 ;;
     --reset)         RESET=1 ;;
     --status)        STATUS_ONLY=1 ;;
-    --help|-h)       sed -n '2,30p' "$0"; exit 0 ;;
+    --help|-h)       sed -n '2,25p' "$0"; exit 0 ;;
     *) die "Unknown flag: $arg (use --help)";;
   esac
 done
 
 # ── status-only path: dump state + exit ──────────────────────────────
 if (( STATUS_ONLY )); then
-  hdr "Worker Agent status"
+  hdr "Eval Worker status"
   docker compose ps 2>/dev/null || die "docker compose not available"
   echo
   say "${DIM}Recent logs:${RST}"
@@ -109,7 +95,7 @@ ok "curl"
 # ── 2. reset if asked ────────────────────────────────────────────────
 if (( RESET )); then
   hdr "Reset requested"
-  warn "This will stop the container and wipe the cached machine JWT."
+  warn "This stops the container and DELETES all tasks, settings, runs, zips and videos."
   if (( ! YES )); then
     read -r -p "Continue? [y/N] " ans
     [[ "${ans,,}" == y* ]] || die "aborted"
@@ -128,25 +114,10 @@ env_get() {
   grep -E "^${1}=" .env 2>/dev/null | tail -1 | cut -d= -f2- || true
 }
 
-CENTRAL_URL="${CLI_CENTRAL:-$(env_get CENTRAL_API_URL)}"
-JOIN_TOKEN="${CLI_TOKEN:-$(env_get WORKER_JOIN_TOKEN)}"
-PUBLIC_URL="${CLI_PUBLIC_URL:-$(env_get WORKER_PUBLIC_URL)}"
 WORKER_NAME="${CLI_NAME:-$(env_get WORKER_NAME)}"
 MODE="${CLI_MODE:-$(env_get EVAL_MODE)}"
 HF_TOKEN_VAL="${CLI_HF_TOKEN:-$(env_get HF_TOKEN)}"
 ADMIN_PASSWORD="${CLI_PASSWORD:-$(env_get WORKER_ADMIN_PASSWORD)}"
-
-# Standalone unless told otherwise: a join token (flag or existing .env)
-# means this worker belongs to the central leaderboard.
-WORKER_MODE_VAL="${CLI_WORKER_MODE:-$(env_get WORKER_MODE)}"
-if [[ -z "$WORKER_MODE_VAL" ]]; then
-  if [[ -n "$JOIN_TOKEN" ]]; then WORKER_MODE_VAL=central; else WORKER_MODE_VAL=standalone; fi
-fi
-case "$WORKER_MODE_VAL" in
-  standalone|central) ;;
-  *) die "WORKER_MODE must be 'standalone' or 'central' (got '${WORKER_MODE_VAL}')";;
-esac
-ok "worker mode: ${WORKER_MODE_VAL}"
 
 prompt() {
   # prompt VAR "label" "default"
@@ -165,66 +136,31 @@ prompt() {
 }
 
 # Worker name — hostname is a sane default
-[[ -n "$WORKER_NAME" ]] || prompt WORKER_NAME "Worker name (shown in admin UI)" "$(hostname -s 2>/dev/null || hostname || echo gpu-node)"
+[[ -n "$WORKER_NAME" ]] || prompt WORKER_NAME "Worker name (shown in the UI)" "$(hostname -s 2>/dev/null || hostname || echo gpu-node)"
 
-if [[ "$WORKER_MODE_VAL" == "standalone" ]]; then
-  # The school's own UI login. Blank → random, printed at the end.
-  if [[ -z "$ADMIN_PASSWORD" ]]; then
-    prompt ADMIN_PASSWORD "UI admin password (Enter = generate one)"
-    [[ -n "$ADMIN_PASSWORD" ]] || ADMIN_PASSWORD="$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | cut -c1-16)"
-  fi
-else
-# Central URL — production default is fine for most schools
-[[ -n "$CENTRAL_URL" ]] || prompt CENTRAL_URL "Central plane URL" "$DEFAULT_CENTRAL_URL"
-
-# Join token — cannot default; require it
-if [[ -z "$JOIN_TOKEN" ]]; then
-  say ""
-  say "${DIM}Get a join token from your SCHOOL_ADMIN's admin dashboard:${RST}"
-  say "${DIM}  ${CENTRAL_URL}/admin/dashboard → Workers → “+ Issue Join Token”${RST}"
-  say ""
-  prompt JOIN_TOKEN "Join token"
-  [[ -n "$JOIN_TOKEN" ]] || die "join token required"
+# UI login. Blank → random, printed at the end.
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+  prompt ADMIN_PASSWORD "UI admin password (Enter = generate one)"
+  [[ -n "$ADMIN_PASSWORD" ]] || ADMIN_PASSWORD="$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | cut -c1-16)"
 fi
 
-# Public URL — try to guess a sensible default
-if [[ -z "$PUBLIC_URL" ]]; then
-  guess="http://$(hostname -f 2>/dev/null || hostname || echo localhost):8081"
-  say ""
-  say "${DIM}Public URL this worker will be reachable at from a student's browser.${RST}"
-  say "${DIM}Must include the port your reverse proxy / port-forward exposes.${RST}"
-  prompt PUBLIC_URL "Worker public URL" "$guess"
-fi
-fi  # central mode
-
-# Mode — default 'real' since partner-school workers always want Isaac
-# Sim; flip to mock explicitly with `--mode=mock` for a smoke test.
-[[ -n "$MODE" ]] || prompt MODE "Evaluation mode (mock|real)" "real"
+# Mode — real unless asked for a GPU-less UI test.
+[[ -n "$MODE" ]] || prompt MODE "Evaluation mode (real|mock)" "real"
+case "$MODE" in
+  mock|real) ;;
+  *) die "EVAL_MODE must be 'mock' or 'real' (got '${MODE}')";;
+esac
 
 # HuggingFace token — optional. lerobot policies (multi_task_dit,
 # smolvla, pi0, …) download weights from huggingface.co on first use.
-# Without a token you're subject to the anonymous rate limit (occasional
-# 429 during simultaneous evals). Any token with `read` scope works —
-# create one at https://huggingface.co/settings/tokens. Skip with Enter.
+# Without a token you're subject to the anonymous rate limit. Any token
+# with `read` scope works. Skip with Enter.
 if [[ -z "$HF_TOKEN_VAL" ]] && (( ! YES )); then
   say ""
   say "${DIM}Optional — HuggingFace token for lerobot weight downloads.${RST}"
   say "${DIM}Get one at https://huggingface.co/settings/tokens (read scope). Press Enter to skip.${RST}"
   prompt HF_TOKEN_VAL "HF_TOKEN (optional)"
 fi
-
-case "$MODE" in
-  mock|real) ;;
-  *) die "EVAL_MODE must be 'mock' or 'real' (got '${MODE}')";;
-esac
-
-# Simulator source for the local real-mode build. Pin AICAPSTONE_REF to the
-# release HCIS-Lab announces (branch, tag or commit) so every school builds
-# the same simulator.
-AICAPSTONE_REPO_VAL="$(env_get AICAPSTONE_REPO)"
-AICAPSTONE_REPO_VAL="${AICAPSTONE_REPO_VAL:-https://github.com/asddzxcc1856/aicapstone.git}"
-AICAPSTONE_REF_VAL="$(env_get AICAPSTONE_REF)"
-AICAPSTONE_REF_VAL="${AICAPSTONE_REF_VAL:-feat/eval-rollout-fixes-nb}"
 
 # ── GPU auto-selection ───────────────────────────────────────────────
 # Every worker container claims exactly one GPU. When the operator spins
@@ -301,20 +237,19 @@ if [[ "$MODE" == "real" ]]; then
     ok "nvidia-smi present"
   fi
   if ! docker info 2>/dev/null | grep -qi 'nvidia'; then
-    die "Docker has no nvidia runtime — install nvidia-container-toolkit (or use --mode=mock for a GPU-less smoke test)"
+    die "Docker has no nvidia runtime — install nvidia-container-toolkit (or use --mode=mock for a GPU-less UI test)"
   else
     ok "nvidia runtime available to docker"
   fi
 fi
 
 # ── Host port auto-selection ─────────────────────────────────────────
-# Every worker container needs its OWN host port because central will
-# hand out `WORKER_PUBLIC_URL/upload/{token}` to student browsers — two
+# Every worker container needs its OWN host port for its UI — two
 # workers on the same host can't both bind :8081.
 #
 # Preference order:
 #   1. If .env already has WORKER_HOST_PORT, reuse (so re-runs are
-#      idempotent and the operator's reverse-proxy config keeps working).
+#      idempotent and bookmarks / reverse-proxy config keep working).
 #   2. Else walk from 8081 upward and pick the first port that is
 #      neither bound on the host nor already declared in ANOTHER
 #      worker-agent container's WORKER_HOST_PORT env.
@@ -353,35 +288,18 @@ if [[ -z "$HOST_PORT" ]]; then
 fi
 
 # Derive a unique container name so two workers on the same host can
-# coexist under docker compose. Falls back to worker-agent-<port>.
+# coexist under docker compose.
 CONTAINER_NAME="worker-agent-${HOST_PORT}"
 
-# If the operator didn't explicitly set WORKER_PUBLIC_URL, and the guess
-# defaulted to :8081, patch it to the actually-picked port so central
-# hands out reachable URLs.
-if [[ "$PUBLIC_URL" == *":8081" && "$HOST_PORT" != "8081" ]]; then
-  PUBLIC_URL="${PUBLIC_URL%:*}:${HOST_PORT}"
-  ok "adjusted WORKER_PUBLIC_URL → ${PUBLIC_URL} to match host port"
-fi
-
 # ── 4. write .env atomically ─────────────────────────────────────────
-# Only rewrite when we actually gathered new values from a prompt/flag,
-# so a returning operator who's added custom fields (e.g. a proxy env
-# var) doesn't silently lose them on `./setup.sh` re-runs.
-existing_matches=0
+# Only rewrite when something changed, so a returning operator who's
+# added custom fields (e.g. a proxy env var) doesn't lose them.
 if [[ -f .env && \
-      "$CENTRAL_URL" == "$(env_get CENTRAL_API_URL)" && \
-      "$JOIN_TOKEN"  == "$(env_get WORKER_JOIN_TOKEN)" && \
-      "$PUBLIC_URL"  == "$(env_get WORKER_PUBLIC_URL)" && \
-      "$WORKER_NAME" == "$(env_get WORKER_NAME)" && \
-      "$MODE"        == "$(env_get EVAL_MODE)" && \
-      "$HF_TOKEN_VAL" == "$(env_get HF_TOKEN)" && \
-      "$WORKER_MODE_VAL" == "$(env_get WORKER_MODE)" && \
-      "$ADMIN_PASSWORD" == "$(env_get WORKER_ADMIN_PASSWORD)" ]]; then
-  existing_matches=1
-fi
-
-if (( existing_matches )); then
+      "$WORKER_NAME"    == "$(env_get WORKER_NAME)" && \
+      "$MODE"           == "$(env_get EVAL_MODE)" && \
+      "$HF_TOKEN_VAL"   == "$(env_get HF_TOKEN)" && \
+      "$ADMIN_PASSWORD" == "$(env_get WORKER_ADMIN_PASSWORD)" && \
+      "$GPU_ID"         == "$(env_get GPU_ID)" ]]; then
   hdr "Reusing existing .env"
   ok "all values unchanged — leaving .env as-is"
 else
@@ -389,44 +307,21 @@ else
   TMP="$(mktemp .env.XXXXXX)"
   cat > "$TMP" <<EOF
 # Generated by setup.sh on $(date -Iseconds)
-# standalone = this worker's own UI runs everything; central = leaderboard worker
-WORKER_MODE=${WORKER_MODE_VAL}
+WORKER_NAME=${WORKER_NAME}
 WORKER_ADMIN_PASSWORD=${ADMIN_PASSWORD}
 
-CENTRAL_API_URL=${CENTRAL_URL}
-WORKER_JOIN_TOKEN=${JOIN_TOKEN}
-WORKER_NAME=${WORKER_NAME}
-WORKER_PUBLIC_URL=${PUBLIC_URL}
+GPU_ID=${GPU_ID}
+EVAL_MODE=${MODE}
+WORKER_HOST_PORT=${HOST_PORT}
+# Unique docker container name so multiple workers on one host don't collide.
+WORKER_CONTAINER_NAME=${CONTAINER_NAME}
+$( [[ "$MODE" == "mock" ]] && echo "COMPOSE_FILE=docker-compose.yml:docker-compose.mock.yml" )
 
 WORKER_STORAGE_ROOT=/var/lib/worker-agent/storage
 WORKER_STATE_DIR=/var/lib/worker-agent/state
 
-GPU_ID=${GPU_ID}
-EVAL_MODE=${MODE}
-ISAAC_SIM_SCRIPT_PATH=/aicapstone/scripts/rollout.py
-
-HEARTBEAT_INTERVAL_SEC=30
-JOB_POLL_INTERVAL_SEC=10
-REQUEST_TIMEOUT_SEC=30
-WORKER_PORT=8080
-WORKER_HOST_PORT=${HOST_PORT}
-
-MAX_CONCURRENT_EVALS=1
-ALLOWED_TASK_KEYS=cup_stacking,cutlery_arrangement,toy_block_collection
-
-# Unique docker container name so multiple worker clones on the same
-# host (each in its own directory / port) don't collide.
-WORKER_CONTAINER_NAME=${CONTAINER_NAME}
-
-# Simulator source for the local real-mode build (re-run ./setup.sh after
-# changing AICAPSTONE_REF to rebuild on a new release).
-AICAPSTONE_REPO=${AICAPSTONE_REPO_VAL}
-AICAPSTONE_REF=${AICAPSTONE_REF_VAL}
-$( [[ "$MODE" == "mock" ]] && echo "COMPOSE_FILE=docker-compose.yml:docker-compose.mock.yml" )
-
 # Optional HuggingFace token — lerobot policies download weights on
-# first eval. Anonymous rate limit is ~10 req/hr per IP so parallel
-# evals easily hit 429; a read-scope token removes that limit.
+# first eval; a read-scope token avoids the anonymous rate limit.
 HF_TOKEN=${HF_TOKEN_VAL}
 EOF
   chmod 600 "$TMP"
@@ -435,27 +330,11 @@ EOF
 fi
 
 # ── 5. build + start ─────────────────────────────────────────────────
-if [[ "$MODE" == "real" ]]; then
-  hdr "Building simulator (aicapstone @ ${AICAPSTONE_REF_VAL})"
-  command -v git >/dev/null 2>&1 || die "git is required to fetch the simulator source"
-  if [[ ! -d aicapstone/.git ]]; then
-    git clone --filter=blob:none "$AICAPSTONE_REPO_VAL" aicapstone \
-      || die "could not clone ${AICAPSTONE_REPO_VAL}"
-  fi
-  git -C aicapstone fetch --quiet origin "$AICAPSTONE_REF_VAL" \
-    || die "could not fetch ${AICAPSTONE_REF_VAL} from ${AICAPSTONE_REPO_VAL}"
-  git -C aicapstone checkout --quiet --detach FETCH_HEAD
-  git -C aicapstone submodule update --init --recursive \
-    || die "could not fetch aicapstone submodules (IsaacLab)"
-  ok "aicapstone at $(git -C aicapstone rev-parse --short HEAD)"
-  # First build installs Isaac Sim (~30 GB, 30-60 min); later builds reuse
-  # cached layers and only redo what changed in the new release.
-  docker build -t aicapstone-sim:local -f aicapstone/Dockerfile aicapstone \
-    || die "simulator image build failed"
-fi
-
-hdr "Starting worker container"
+hdr "Building worker image"
+# First real-mode build installs Isaac Sim + IsaacLab (~30 GB, 30-60 min);
+# later builds reuse cached layers and only redo what changed.
 docker compose build || die "worker image build failed"
+hdr "Starting worker container"
 docker compose up -d
 echo
 
@@ -475,50 +354,18 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-# ── 7. confirm central sees us ───────────────────────────────────────
-if [[ "$WORKER_MODE_VAL" == "standalone" ]]; then
-  hdr "Done"
-  say "${GRN}Worker \"${WORKER_NAME}\" is up in standalone mode.${RST}"
-  say ""
-  say "Open the eval UI:  ${BOLD}http://$(hostname -I 2>/dev/null | awk '{print $1}'):${HOST_PORT}/${RST}"
-  say "Admin password:    ${BOLD}${ADMIN_PASSWORD}${RST}   (WORKER_ADMIN_PASSWORD in .env)"
-  say ""
-  say "Define tasks + eval settings there, then upload policy zips to evaluate."
-  say "  ${BLU}docker compose logs -f${RST}          tail live logs"
-  say "  ${BLU}./setup.sh --status${RST}             one-shot health snapshot"
-  exit 0
-fi
-hdr "Waiting for central registration"
-# We don't have a machine JWT locally so we can't ask central directly.
-# Instead we wait for the agent's own logs to say `registered as worker <id>`,
-# which is emitted after the /register or first heartbeat succeeds.
-found=0
-for i in $(seq 1 30); do
-  if docker compose logs --tail=200 worker-agent 2>/dev/null | grep -qE 'registered as worker|heartbeat: ok'; then
-    found=1
-    break
-  fi
-  sleep 2
-done
-
-if (( found )); then
-  worker_id="$(docker compose logs --tail=200 worker-agent 2>/dev/null \
-    | grep -oE 'registered as worker [0-9]+' | tail -1 | awk '{print $NF}')"
-  ok "central acknowledged registration${worker_id:+ (worker #${worker_id})}"
-else
-  warn "no 'registered'/'heartbeat: ok' line in logs yet — check with:"
-  say "    docker compose logs -f worker-agent"
-fi
-
-# ── 8. wrap-up ───────────────────────────────────────────────────────
+# ── 7. wrap-up ───────────────────────────────────────────────────────
 hdr "Done"
-say "${GRN}Worker \"${WORKER_NAME}\" is up.${RST}"
+say "${GRN}Worker \"${WORKER_NAME}\" is up (${MODE} mode).${RST}"
+say ""
+say "Open the eval UI:  ${BOLD}http://$(hostname -I 2>/dev/null | awk '{print $1}'):${HOST_PORT}/${RST}"
+say "Admin password:    ${BOLD}${ADMIN_PASSWORD}${RST}   (WORKER_ADMIN_PASSWORD in .env)"
+say ""
+say "Define tasks + eval settings there, then upload policy zips to evaluate."
 say ""
 say "Useful commands:"
 say "  ${BLU}docker compose logs -f${RST}          tail live logs"
 say "  ${BLU}docker compose ps${RST}               container status"
-say "  ${BLU}docker compose restart${RST}          restart after a config change"
+say "  ${BLU}git pull && ./setup.sh --yes${RST}    update to a new release"
 say "  ${BLU}./setup.sh --status${RST}             one-shot health snapshot"
-say "  ${BLU}./setup.sh --reset --yes${RST}        wipe state + start over"
-say ""
-say "The SCHOOL_ADMIN dashboard on central should now show this worker as ${GRN}ONLINE${RST}."
+say "  ${BLU}./setup.sh --reset --yes${RST}        wipe everything + start over"

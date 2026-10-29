@@ -1,79 +1,224 @@
 # syntax = docker/dockerfile:1.7
-# Real Isaac Sim worker image, built on the school's own machine.
+# Eval worker image: Isaac Sim 5.1 + IsaacLab + the simulator package in
+# sim/ + the worker (UI, run queue). Built on the school's own machine by
+# setup.sh (`docker compose build`); no other repository is needed except
+# IsaacLab, fetched below from NVIDIA at a pinned commit.
 #
-# Layers the worker_agent runtime on top of the simulator base image
-# (isaacsim 5.1 + IsaacLab + the aicapstone simulator + a Python 3.12
-# lerobot sidecar venv), which setup.sh builds first from the pinned
-# aicapstone checkout:
-#
-#   docker build -t aicapstone-sim:local -f aicapstone/Dockerfile aicapstone
-#   docker compose build          # this file; see docker-compose.yml
-#
-# Build context = this worker directory. The aicapstone checkout comes in
-# as the named context `aicapstone` (compose `additional_contexts`), e.g.
-#   docker build -f Dockerfile.real --build-context aicapstone=./aicapstone .
-#
-# Eval task configs are NOT baked in: the worker fetches the config for
-# each job from central (/api/workers/submissions/<id>/task-config), so
-# every school grades with the version central currently holds.
+# Layer order puts the slow, rarely-changing installs first: editing
+# sim/packages/simulator rebuilds from that COPY on, editing sim/scripts
+# or the worker code only rebuilds the last few layers.
 #
 # Requires an NVIDIA driver on the host + nvidia-container-toolkit.
-ARG BASE_IMAGE=aicapstone-sim:local
-FROM ${BASE_IMAGE}
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
-# worker_agent's Python runtime deps — separate from the isaacsim
-# environment installed in the base image.
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PYTHON_VERSION=3.11
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=5 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ACCEPT_EULA=Y \
+    OMNI_KIT_ACCEPT_EULA=YES \
+    PRIVACY_CONSENT=Y \
+    TERM=xterm-256color
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries \
+    && echo 'Acquire::https::Timeout "120";' >> /etc/apt/apt.conf.d/80-retries \
+    && echo 'Acquire::http::Timeout "120";' >> /etc/apt/apt.conf.d/80-retries
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gpg \
+    && curl --retry 5 --retry-delay 10 --retry-all-errors -fsSL \
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" \
+        | gpg --dearmor -o /usr/share/keyrings/deadsnakes.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main" \
+        > /etc/apt/sources.list.d/deadsnakes.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        libasound2 \
+        libdbus-1-3 \
+        libegl1 \
+        libfontconfig1 \
+        libgl1 \
+        libglu1-mesa \
+        libglib2.0-0 \
+        libgtk-3-0 \
+        libice6 \
+        libnss3 \
+        libsm6 \
+        libvulkan1 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxcb-cursor0 \
+        libxcb-icccm4 \
+        libxcb-image0 \
+        libxcb-keysyms1 \
+        libxcb-render-util0 \
+        libxcb-xinerama0 \
+        libxcb-xkb1 \
+        libxcursor1 \
+        libxext6 \
+        libxi6 \
+        libxinerama1 \
+        libxkbcommon-x11-0 \
+        libxrandr2 \
+        libxrender1 \
+        libxt6 \
+        libxtst6 \
+        libxxf86vm1 \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-distutils \
+        python${PYTHON_VERSION}-venv \
+        unzip \
+        vulkan-tools \
+        wget \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
+    && curl --retry 5 --retry-delay 10 --retry-all-errors -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+    && python /tmp/get-pip.py \
+    && rm -f /tmp/get-pip.py \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/aicapstone
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -U \
+        torch==2.7.0 \
+        torchvision==0.22.0 \
+        --index-url https://download.pytorch.org/whl/cu128 \
+    && python -m pip install --upgrade \
+        "isaacsim[all,extscache]==5.1.0" \
+        --extra-index-url https://pypi.nvidia.com \
+    && python -m pip install \
+        pip==23 \
+        setuptools==65 \
+        flatdict==4.0.0 \
+        huggingface-hub==0.35.3 \
+        transformers==4.57.6 \
+        num2words==0.5.13
+
+# IsaacLab, pinned to the commit the simulator is developed against.
+ARG ISAACLAB_COMMIT=4df6560e187f2cc66685b41b21b259f4485d0c22
+RUN git init -q dependencies/IsaacLab \
+    && git -C dependencies/IsaacLab fetch -q --depth 1 \
+        https://github.com/isaac-sim/IsaacLab.git "${ISAACLAB_COMMIT}" \
+    && git -C dependencies/IsaacLab checkout -q FETCH_HEAD \
+    && rm -rf dependencies/IsaacLab/.git
+
+RUN python -m pip install --no-deps \
+        setuptools==65 \
+        wheel==0.45.1 \
+        toml==0.10.2 \
+        packaging==23.0 \
+        poetry-core==2.2.1 \
+    && sed -i 's|-m pip install"|-m pip install --no-build-isolation"|' \
+        dependencies/IsaacLab/isaaclab.sh \
+    && cd dependencies/IsaacLab \
+    && ./isaaclab.sh --install
+
+RUN python -m pip install --no-deps numpy==1.26.0
+
+# ── Sidecar venv for lerobot >=0.5.1 policies (multi_task_dit, etc.) ─────────
+# isaacsim 5.1 pins Python ==3.11 and lerobot 0.5.1 pins Python >=3.12, so
+# these two cannot coexist in one interpreter. We install Python 3.12 + a
+# dedicated venv whose only purpose is to host lerobot inference for policy
+# types whitelisted by SIDECAR_POLICY_TYPES in scripts/rollout.py. The main
+# (3.11) interpreter drives Isaac Sim and shells out to this venv via
+# scripts/policy_sidecar.py, exchanging observations / actions over pipes.
+# Placed before the simulator COPY so simulator edits do not rebuild it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.12 -m venv /opt/lerobot-py312 \
+    && /opt/lerobot-py312/bin/pip install --upgrade pip \
+    && /opt/lerobot-py312/bin/pip install \
+        torch==2.7.0 \
+        torchvision==0.22.0 \
+        --index-url https://download.pytorch.org/whl/cu128 \
+    && /opt/lerobot-py312/bin/pip install \
+        "lerobot[multi_task_dit]==0.5.1"
+
+COPY sim/packages/simulator /workspace/aicapstone/packages/simulator
+
+RUN python -m pip install --upgrade \
+        setuptools==80.10.2 \
+        wheel==0.45.1 \
+        cython==3.0.11 \
+        toml==0.10.2 \
+        packaging==24.2
+
+# Newer pyarrow (e.g. 26) requires NumPy 2; Isaac Sim needs numpy 1.26, and datasets (LeRobot) needs pyarrow>=21.
+RUN printf "numpy==1.26.0\npyarrow==21.0.0\n" > /tmp/sim-constraints.txt \
+    && python -m pip install --use-deprecated=legacy-resolver \
+        --no-build-isolation \
+        -c /tmp/sim-constraints.txt \
+        -e packages/simulator \
+    && python -m pip install --no-deps numpy==1.26.0 \
+    && rm -f /tmp/sim-constraints.txt
+
+RUN python -m pip install --upgrade pip==26.0.1 \
+    && python -m pip install --no-deps numpy==1.26.0
+
+# The simulator install can drag in cuda-bindings[all] → cuda-toolkit 13 and the
+# CUDA 13 nvidia-* wheels. They share nvidia/<lib>/lib with torch's cu12 wheels and
+# overwrite them (torch then loads cuDNN 9.24/cu13 → CUDNN_STATUS_NOT_INITIALIZED on
+# 535.x drivers). Drop the CUDA 13 set and force-reinstall the cu12 wheels torch needs.
+RUN CU13=$(python -m pip list --format=freeze 2>/dev/null | cut -d= -f1 \
+        | grep -E '^(cuda-toolkit|cuda-bindings|cuda-pathfinder|nvidia-[a-z-]+-cu13|nvidia-(cublas|cuda-cupti|cuda-nvrtc|cuda-runtime|cufft|cufile|curand|cusolver|cusparse|nvjitlink|nvtx))$' || true) \
+    && if [ -n "$CU13" ]; then python -m pip uninstall -y $CU13; fi \
+    && python -m pip install --no-deps --force-reinstall \
+        $(python -m pip list --format=freeze 2>/dev/null | grep -E '^nvidia-.*-cu12==') \
+    && python -c "import torch; assert torch.backends.cudnn.version() < 90800, torch.backends.cudnn.version()"
+
+# Rollout entry point + its lerobot>=0.5 sidecar.
+COPY sim/scripts/ /workspace/aicapstone/scripts/
+
+# ── Worker ────────────────────────────────────────────────────────────
+# worker's Python runtime deps — separate from the isaacsim environment.
 RUN pip install --no-cache-dir \
         "fastapi==0.115.0" \
         "uvicorn[standard]==0.30.0" \
-        "httpx==0.27.2" \
         "python-multipart==0.0.9" \
-        "pydantic==2.9.0" \
-        "pydantic-settings==2.5.0"
-
-# Worker source (.dockerignore keeps .env and the aicapstone checkout out).
-COPY . /app/worker_agent/
-
-# The base image only installs packages/simulator; bake the rollout entry
-# point (and its policy sidecar) from the same pinned checkout.
-COPY --from=aicapstone scripts/ /workspace/aicapstone/scripts/
-
-# The base image inherits ENTRYPOINT from isaacsim/IsaacLab launchers
-# (`/isaac-sim/python.sh` in some layers). Override so the worker's
-# main loop runs instead.
-WORKDIR /app
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app \
-    WORKER_STORAGE_ROOT=/var/lib/worker-agent/storage \
-    WORKER_STATE_DIR=/var/lib/worker-agent/state \
-    WORKER_PORT=8080
-RUN mkdir -p /var/lib/worker-agent/storage /var/lib/worker-agent/state
-
-# The worker's default `ISAAC_SIM_SCRIPT_PATH=/aicapstone/scripts/rollout.py`
-# assumes the tree at /aicapstone; the base image installs it under
-# /workspace/aicapstone.
-RUN ln -snf /workspace/aicapstone /aicapstone
+        "pydantic==2.9.0"
 
 # Bake a pre-warmed Omniverse Kit cache captured from a `--validate_only`
 # run of one of the eval tasks. Saves ~30s of shader-compile + registry
-# lookup on a school's very first real eval. The cache is small (~15 MB
-# uncompressed / 4 MB tarball) because heavy USDs are already baked into
-# /workspace/aicapstone. Runtime writes to a mounted volume so this seed
-# only matters until the volume grows its own copy.
+# lookup on a school's very first eval. Runtime writes to a mounted volume
+# so this seed only matters until the volume grows its own copy.
 COPY ov-cache.tgz /tmp/ov-cache.tgz
 RUN mkdir -p /root/.cache/ov \
  && tar xzf /tmp/ov-cache.tgz -C /root/.cache/ov \
  && rm /tmp/ov-cache.tgz
 
+COPY *.py /app/worker_agent/
+COPY ui/ /app/worker_agent/ui/
+
+WORKDIR /app
+ENV PYTHONPATH=/app \
+    WORKER_STORAGE_ROOT=/var/lib/worker-agent/storage \
+    WORKER_STATE_DIR=/var/lib/worker-agent/state \
+    WORKER_PORT=8080 \
+    ISAAC_SIM_SCRIPT_PATH=/workspace/aicapstone/scripts/rollout.py
+RUN mkdir -p /var/lib/worker-agent/storage /var/lib/worker-agent/state
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 EXPOSE 8080
-ENTRYPOINT []
-# Invoke uvicorn directly so `worker_agent.main` is imported ONCE. Using
-# `python -m worker_agent.main` also worked but Python treats the entry
-# module both as `__main__` and as `worker_agent.main` — that duplicated
-# every `@app.on_event('startup')` handler, spawning two heartbeat and
-# two job-poll threads. `_startup` also has an idempotency guard now,
-# but this belt-AND-braces prevents the whole class of issue.
+# uvicorn imports worker_agent.main once (`python -m` would import it twice).
 CMD ["uvicorn", "worker_agent.main:app", "--host", "0.0.0.0", "--port", "8080"]

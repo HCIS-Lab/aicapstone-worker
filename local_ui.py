@@ -1,6 +1,6 @@
-"""Standalone-mode web UI + JSON API, mounted on the worker's own port.
+"""Web UI + JSON API, served on the worker's own port.
 
-Everything a school needs without central: define eval tasks (built-in
+Everything a school needs: define eval tasks (built-in
 simulator tasks or their own eval config .py), set eval settings, upload
 policy zips, watch the queue / live log, replay videos.
 
@@ -41,7 +41,7 @@ _MAX_ZIP = 6 * 1024 * 1024 * 1024
 _MAX_TASK_SRC = 1024 * 1024
 _NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 _GYM_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$")
-# Same rule as central's REQUIRED_FILES check: names anywhere in the zip.
+# Required policy files, matched by name anywhere in the zip.
 _REQUIRED_FILES = {"config.json", "model.safetensors"}
 
 _sessions: dict[str, float] = {}

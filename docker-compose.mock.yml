@@ -1,19 +1,16 @@
 # Mock-mode override: builds the slim python image from ./Dockerfile and
-# runs without a GPU. Rollouts return synthetic scores, so use this only
-# to smoke-test registration / uploads, never for real grading.
+# runs without a GPU. Runs return synthetic scores, so use this only to
+# try out the UI, never for real grading.
 #
 # setup.sh --mode=mock enables it by writing
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.mock.yml
 # into .env, which every later `docker compose` command picks up.
-# `!reset` needs docker compose >= 2.24.
 
 services:
   worker-agent:
     build:
       context: .
       dockerfile: Dockerfile
-      additional_contexts: !reset {}
-      args: !reset {}
     image: aicapstone-worker-mock:local
     pull_policy: build
     runtime: runc
