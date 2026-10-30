@@ -168,7 +168,8 @@ videos are kept in docker volumes and survive the update.
 ├── rollout.py             ← runs sim/scripts/rollout.py, parses the score
 ├── storage.py             ← on-disk layout
 ├── config.py              ← env vars
-├── ui/index.html          ← the web UI (no build step)
+├── frontend/              ← web UI: Vue 3 + Vite + Tailwind, same design as the
+│                            leaderboard; built inside the image (no Node on the host)
 ├── ov-cache.tgz           ← pre-warmed Omniverse cache baked into the image
 └── sim/                   ← simulator source
     ├── packages/simulator/    ← tasks, scenes, assets (pip-installed in the image)
@@ -177,6 +178,17 @@ videos are kept in docker volumes and survive the update.
         └── policy_sidecar.py  ← lerobot ≥0.5 policies (Python 3.12 venv)
 ```
 
+### Changing the UI
+
+```bash
+cd frontend
+npm ci
+VITE_WORKER_URL=http://localhost:8081 npm run dev   # hot reload, API proxied to a running worker
+```
+
+Open `http://localhost:5173/`. `./setup.sh --yes` rebuilds the image with
+the change (the `ui` stage in the Dockerfiles runs `npm run build`).
+
 IsaacLab is fetched during the build from `github.com/isaac-sim/IsaacLab`
 at a pinned commit (`ISAACLAB_COMMIT` in `Dockerfile.real`).
 
@@ -184,12 +196,12 @@ at a pinned commit (`ISAACLAB_COMMIT` in `Dockerfile.real`).
 
 | Method | Path | Auth |
 |---|---|---|
-| GET | `/` | UI page |
+| GET | `/`, `/runs/{id}`, `/tasks`, … | UI (SPA, any non-API path) |
 | GET | `/health` | none |
 | POST | `/api/login`, `/api/logout` | password → HttpOnly session cookie |
-| GET/PUT | `/api/settings` | session |
+| GET/PUT | `/api/settings`, GET `/api/settings/defaults` | session |
 | GET / PUT / DELETE | `/api/tasks`, `/api/tasks/{name}` | session |
-| GET / POST | `/api/runs` (POST = multipart upload) | session |
+| GET / POST | `/api/runs` (POST = multipart upload), GET `/api/runs/{id}` | session |
 | GET | `/api/runs/{id}/log`, `/api/runs/{id}/video` | session |
 | POST | `/api/runs/{id}/rerun`, `/api/runs/{id}/cancel` | session |
 | DELETE | `/api/runs/{id}` | session |

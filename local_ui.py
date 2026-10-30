@@ -4,6 +4,10 @@ Everything a school needs: define eval tasks (built-in
 simulator tasks or their own eval config .py), set eval settings, upload
 policy zips, watch the queue / live log, replay videos.
 
+The UI is the Vue app in frontend/, built into ui/ by the Docker build
+(`npm run build`); this module serves it with an SPA fallback so deep
+links like /runs/12 load index.html.
+
 Auth is a single admin password (WORKER_ADMIN_PASSWORD, or generated on
 first boot into STATE_DIR/admin_password) exchanged for an HttpOnly
 session cookie.
@@ -25,6 +29,7 @@ from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile,
 )
 from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from worker_agent import local_runner
@@ -34,7 +39,7 @@ from worker_agent.storage import submission_dir, video_path_for, zip_path_for
 
 log = logging.getLogger("worker.ui")
 
-_UI_FILE = Path(__file__).parent / "ui" / "index.html"
+_UI_DIR = Path(__file__).parent / "ui"
 _COOKIE = "wa_session"
 _SESSION_TTL = 7 * 24 * 3600
 _MAX_ZIP = 6 * 1024 * 1024 * 1024
@@ -107,13 +112,43 @@ class TaskBody(BaseModel):
     overrides: Optional[dict] = None
 
 
+def _with_file_flags(runs: list[dict]) -> list[dict]:
+    """Add has_video / has_zip and, for QUEUED runs, the queue position
+    (the run loop claims the lowest id first)."""
+    queued = sorted(r["id"] for r in get_store().list_runs() if r["status"] == "QUEUED")
+    for run in runs:
+        run["has_video"] = video_path_for(run["id"]).is_file()
+        run["has_zip"] = zip_path_for(run["id"]).is_file()
+        run["queue_position"] = (queued.index(run["id"]) + 1
+                                 if run["status"] == "QUEUED" else None)
+    return runs
+
+
+def mount_ui(app) -> None:
+    """Serve the built Vue app. Call after all API routes are registered:
+    the catch-all returns index.html for any other GET."""
+    index = _UI_DIR / "index.html"
+    if (_UI_DIR / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=_UI_DIR / "assets"), name="ui-assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def spa(path: str):
+        if path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="not found")
+        f = (_UI_DIR / path).resolve()
+        if path and f.is_file() and f.is_relative_to(_UI_DIR.resolve()):
+            return FileResponse(f)
+        if not index.is_file():
+            return PlainTextResponse(
+                "UI not built: run `npm ci && npm run build` in frontend/ "
+                "and copy dist/ to ui/ (the Docker build does this).", status_code=503)
+        return FileResponse(index, media_type="text/html",
+                            headers={"Cache-Control": "no-cache"})
+
+
 def build_router() -> APIRouter:
     r = APIRouter()
     auth = [Depends(require_login)]
-
-    @r.get("/", include_in_schema=False)
-    def index():
-        return FileResponse(_UI_FILE, media_type="text/html")
 
     # ── Session ──────────────────────────────────────────────────────
     @r.post("/api/login")
@@ -142,6 +177,10 @@ def build_router() -> APIRouter:
     @r.get("/api/settings", dependencies=auth)
     def get_settings():
         return get_store().get_settings()
+
+    @r.get("/api/settings/defaults", dependencies=auth)
+    def get_default_settings():
+        return DEFAULT_SETTINGS
 
     @r.put("/api/settings", dependencies=auth)
     def put_settings(body: dict):
@@ -215,11 +254,12 @@ def build_router() -> APIRouter:
 
     @r.get("/api/runs", dependencies=auth)
     def list_runs():
-        runs = get_store().list_runs()
-        for run in runs:
-            run["has_video"] = video_path_for(run["id"]).is_file()
-            run["has_zip"] = zip_path_for(run["id"]).is_file()
+        runs = _with_file_flags(get_store().list_runs())
         return {"current": local_runner.current_run(), "runs": runs}
+
+    @r.get("/api/runs/{rid}", dependencies=auth)
+    def get_run(rid: int):
+        return _with_file_flags([_run_or_404(rid)])[0]
 
     @r.post("/api/runs", dependencies=auth)
     async def create_run(

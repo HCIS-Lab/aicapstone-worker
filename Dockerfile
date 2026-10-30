@@ -1,6 +1,14 @@
 # Mock-mode image: the UI and run queue without Isaac Sim or a GPU.
 # Runs return synthetic scores — for trying out the UI, never for grading.
 # Real evaluations use Dockerfile.real.
+# ── Web UI (Vue + Vite, frontend/) → static files ────────────────────
+FROM node:20-alpine AS ui
+WORKDIR /ui
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,7 +21,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./worker_agent/
-COPY ui/ ./worker_agent/ui/
+COPY --from=ui /ui/dist/ ./worker_agent/ui/
 
 RUN mkdir -p /var/lib/worker-agent/storage /var/lib/worker-agent/state
 

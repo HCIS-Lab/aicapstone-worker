@@ -9,6 +9,16 @@
 # or the worker code only rebuilds the last few layers.
 #
 # Requires an NVIDIA driver on the host + nvidia-container-toolkit.
+
+# ── Web UI (Vue + Vite, frontend/) → static files ────────────────────
+FROM node:20-alpine AS ui
+WORKDIR /ui
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
+# ── Worker image ─────────────────────────────────────────────────────
 FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -206,7 +216,7 @@ RUN mkdir -p /root/.cache/ov \
  && rm /tmp/ov-cache.tgz
 
 COPY *.py /app/worker_agent/
-COPY ui/ /app/worker_agent/ui/
+COPY --from=ui /ui/dist/ /app/worker_agent/ui/
 
 WORKDIR /app
 ENV PYTHONPATH=/app \

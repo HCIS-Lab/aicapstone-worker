@@ -4,3 +4,7 @@
 # Simulator checkout cloned by older setup.sh versions; the source is in sim/ now.
 aicapstone/
 __pycache__/
+frontend/node_modules/
+frontend/dist/
+# Built UI (copied from frontend/dist for running outside Docker).
+ui/

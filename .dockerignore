@@ -7,3 +7,7 @@ aicapstone/
 __pycache__/
 *.pyc
 .git/
+# Built inside the image (Dockerfile `ui` stage), never copied from the host.
+frontend/node_modules/
+frontend/dist/
+ui/
