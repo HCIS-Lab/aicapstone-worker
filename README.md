@@ -81,11 +81,23 @@ return synthetic scores.
 
 ## 3. Using the UI
 
-| Tab | What you can do |
+Everyone signs in on the same login page. **Admin**: group name `admin`
+and the admin password, which opens the admin pages (`/admin/…`).
+**Students**: the group name and password the admin created for them, which
+opens the leaderboard: submit a model, follow their own runs, see the
+ranking.
+
+| Admin tab | What you can do |
 |---|---|
 | **Runs** | Upload a policy zip, pick the task, optionally override episodes / episode length for this run. Watch the queue, live progress and log; cancel, re-run, delete; replay the recorded video |
+| **Groups** | Create student group accounts (one per line; passwords generated or given, shown once), assign each a task or let it choose, reset passwords, delete |
 | **Tasks** | Built-in tasks are pre-loaded: `cup_stacking`, `cutlery_arrangement`, `toy_blocks_collection`. Add your own by pasting or uploading an eval config `.py`, or by entering any registered gym id. Each task can set its own episodes and episode length |
-| **Settings** | Episodes per eval, episode length, total timeout (0 = none), device, action-horizon override, video recording on/off |
+| **Settings** | Episodes per eval, episode length, total timeout (0 = none), device, action-horizon override, submissions per group per 24 h (0 = unlimited), video recording on/off |
+
+| Student page | What a group can do |
+|---|---|
+| **Leaderboard** | Per-task ranking (best finished run per group, shorter run wins ties), their own submissions, and **Submit model** for their assigned task within the quota |
+| **Submission #id** | Status, queue position, live progress, success rate. Groups see only their own runs, and not the log, the video or the eval settings |
 
 Precedence for a run: **run override > task override > Settings**.
 
@@ -102,7 +114,7 @@ or success condition, and register it under a new gym id).
 
 Runs execute one at a time on this worker's GPU, in upload order.
 
-**Security:** the UI is protected only by the admin password over plain
+**Security:** the UI is protected only by passwords over plain
 HTTP. Keep the port on the campus network, or put an HTTPS reverse proxy
 in front of it.
 
@@ -115,7 +127,7 @@ in front of it.
 | Var | Default | Notes |
 |---|---|---|
 | `WORKER_NAME` | hostname | Shown in the UI header |
-| `WORKER_ADMIN_PASSWORD` | *(generated)* | UI login. If empty the worker generates one and logs it on start |
+| `WORKER_ADMIN_PASSWORD` | *(generated)* | Password of the `admin` login. If empty the worker generates one and logs it on start |
 | `GPU_ID` | auto-picked | Host GPU index this worker uses |
 | `EVAL_MODE` | `real` | `real` \| `mock` |
 | `WORKER_HOST_PORT` | auto-picked | Host port of the UI, first free in `8081..8181` |
@@ -143,7 +155,7 @@ videos are kept in docker volumes and survive the update.
 
 | Volume | Contents | If deleted |
 |---|---|---|
-| `worker_state` | `local.db` (tasks, settings, runs), generated password | Custom tasks, settings and history are gone |
+| `worker_state` | `local.db` (tasks, settings, groups, runs), generated password | Custom tasks, settings, group accounts and history are gone |
 | `worker_storage` | Policy zips, logs, videos (`runs/sid=<id>/`) | Re-run and replay no longer possible |
 | `worker_ov_cache` | Omniverse asset cache | Next eval re-downloads assets (slow) |
 
@@ -196,15 +208,18 @@ at a pinned commit (`ISAACLAB_COMMIT` in `Dockerfile.real`).
 
 | Method | Path | Auth |
 |---|---|---|
-| GET | `/`, `/runs/{id}`, `/tasks`, … | UI (SPA, any non-API path) |
+| GET | `/`, `/leaderboard`, `/admin/runs/{id}`, … | UI (SPA, any non-API path) |
 | GET | `/health` | none |
-| POST | `/api/login`, `/api/logout` | password → HttpOnly session cookie |
-| GET/PUT | `/api/settings`, GET `/api/settings/defaults` | session |
-| GET / PUT / DELETE | `/api/tasks`, `/api/tasks/{name}` | session |
-| GET / POST | `/api/runs` (POST = multipart upload), GET `/api/runs/{id}` | session |
-| GET | `/api/runs/{id}/log`, `/api/runs/{id}/video` | session |
-| POST | `/api/runs/{id}/rerun`, `/api/runs/{id}/cancel` | session |
-| DELETE | `/api/runs/{id}` | session |
+| POST | `/api/login` (`username`, `password`), `/api/logout` | → HttpOnly session cookie |
+| GET | `/api/me`, `/api/leaderboard`, `/api/tasks` | any session (groups get a reduced task list) |
+| GET | `/api/me/stats` | group: quota left, best score, rank |
+| GET / POST | `/api/runs` (POST = multipart upload), GET `/api/runs/{id}` | any session; groups: own runs only, assigned task, quota, no overrides |
+| GET/PUT | `/api/settings`, GET `/api/settings/defaults` | admin |
+| GET / POST / PUT / DELETE | `/api/users`, `/api/users/{id}` | admin |
+| PUT / DELETE | `/api/tasks/{name}` (GET too) | admin |
+| GET | `/api/runs/{id}/log`, `/api/runs/{id}/video` | admin |
+| POST | `/api/runs/{id}/rerun`, `/api/runs/{id}/cancel` | admin |
+| DELETE | `/api/runs/{id}` | admin |
 
 ---
 

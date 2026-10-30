@@ -70,7 +70,7 @@
           <option value="">All tasks</option>
           <option v-for="t in taskNames" :key="t" :value="t">{{ t }}</option>
         </select>
-        <input v-model="search" placeholder="Search label / zip / id / policy"
+        <input v-model="search" placeholder="Search group / label / zip / id / policy"
                class="px-3 py-2 rounded-xl bg-surface-900 border border-white/10 text-xs text-white focus:border-brand-500 outline-none flex-1 min-w-[180px]" />
         <span class="text-[10px] text-gray-500 ml-auto">
           {{ filteredRuns.length }} / {{ runs.length }} shown
@@ -82,6 +82,7 @@
           <thead class="bg-white/2">
             <tr>
               <th class="px-4 py-3 text-left text-[10px] font-black text-gray-500 uppercase tracking-widest">ID</th>
+              <th class="px-4 py-3 text-left text-[10px] font-black text-gray-500 uppercase tracking-widest">Group</th>
               <th class="px-4 py-3 text-left text-[10px] font-black text-gray-500 uppercase tracking-widest">Checkpoint</th>
               <th class="px-4 py-3 text-left text-[10px] font-black text-gray-500 uppercase tracking-widest">Task</th>
               <th class="px-4 py-3 text-left text-[10px] font-black text-gray-500 uppercase tracking-widest">Policy</th>
@@ -95,6 +96,9 @@
           <tbody class="divide-y divide-white/[0.03]">
             <tr v-for="run in filteredRuns" :key="run.id" class="hover:bg-white/[0.02]">
               <td class="px-4 py-3 font-mono text-xs text-gray-500">#{{ run.id }}</td>
+              <td class="px-4 py-3 text-sm font-bold" :class="run.user_id ? 'text-brand-300' : 'text-gray-500 italic'">
+                {{ run.owner || 'admin' }}
+              </td>
               <td class="px-4 py-3">
                 <div class="text-white font-bold truncate max-w-[260px]" :title="run.label || run.zip_name">
                   {{ run.label || run.zip_name || '—' }}
@@ -147,7 +151,7 @@
               <td class="px-4 py-3 text-xs text-gray-400 whitespace-nowrap">{{ formatLocalCompact(run.created_at) }}</td>
               <td class="px-4 py-3 text-right">
                 <div class="flex gap-2 justify-end items-center">
-                  <router-link :to="`/runs/${run.id}`"
+                  <router-link :to="`/admin/runs/${run.id}`"
                                class="px-3 py-1 rounded-md bg-white/5 border border-white/10 text-gray-300 text-[10px] font-black uppercase hover:text-white hover:bg-brand-500/20 hover:border-brand-500/30">
                     View
                   </router-link>
@@ -171,7 +175,7 @@
               </td>
             </tr>
             <tr v-if="!filteredRuns.length">
-              <td colspan="9" class="px-4 py-12 text-center text-gray-600 italic text-sm">
+              <td colspan="10" class="px-4 py-12 text-center text-gray-600 italic text-sm">
                 {{ runs.length ? 'No runs match the current filters.' : 'No runs yet — click "New evaluation" to upload a checkpoint.' }}
               </td>
             </tr>
@@ -219,7 +223,7 @@
               <div class="space-y-3">
                 <label class="block text-[10px] font-black text-gray-500 uppercase tracking-widest">Task</label>
                 <div v-if="!tasks.length" class="p-5 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-sm">
-                  No tasks defined. <router-link to="/tasks" class="underline">Add one</router-link> first.
+                  No tasks defined. <router-link to="/admin/tasks" class="underline">Add one</router-link> first.
                 </div>
                 <div class="grid grid-cols-2 gap-3">
                   <button v-for="t in tasks" :key="t.name"
@@ -418,7 +422,7 @@ const loading = ref(false)
 
 const statusFilter = ref('')
 const taskFilter = ref('')
-const search = ref('')
+const search = ref(route.query.q || '')
 
 const replay = ref(null)
 
@@ -441,7 +445,7 @@ const filteredRuns = computed(() => {
         && !(statusFilter.value === 'QUEUED' && r.status === 'UPLOADING')) return false
     if (taskFilter.value && r.task_name !== taskFilter.value) return false
     if (!q) return true
-    return [String(r.id), r.label, r.zip_name, r.policy_type, r.task_name]
+    return [String(r.id), r.owner, r.label, r.zip_name, r.policy_type, r.task_name]
       .some(v => v && String(v).toLowerCase().includes(q))
   })
 })
@@ -629,7 +633,7 @@ async function handleSubmit() {
     form.episode_length_s = ''
     isSubmitting.value = false
     closeSubmit()
-    router.push(`/runs/${data.id}`)
+    router.push(`/admin/runs/${data.id}`)
   } catch (err) {
     submitError.value = errorText(err, 'Upload failed')
   } finally {

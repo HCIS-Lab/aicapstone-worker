@@ -24,6 +24,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "device": "cuda:0",
     "record_video": True,
     "action_horizon": None,    # None = from the checkpoint / per-policy default
+    "daily_quota": 3,          # submissions per group per 24 h; 0 = unlimited
 }
 
 # Tasks that ship with the simulator package; `--task` takes the gym id
@@ -50,8 +51,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     overrides   TEXT NOT NULL DEFAULT '{}',
     updated_at  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    assigned_task TEXT,            -- NULL = may submit to any task
+    created_at    TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER,         -- NULL = submitted by the admin
+    owner         TEXT,            -- username at submit time (kept if the user is deleted)
     label         TEXT,
     task_name     TEXT NOT NULL,
     status        TEXT NOT NULL,   -- UPLOADING / QUEUED / RUNNING / FINISHED / FAILED
@@ -85,6 +95,11 @@ class LocalStore:
         self._lock = threading.Lock()
         with self._lock, self._db:
             self._db.executescript(_SCHEMA)
+            # Databases from before group accounts existed.
+            cols = {r[1] for r in self._db.execute("PRAGMA table_info(runs)")}
+            for col, typ in (("user_id", "INTEGER"), ("owner", "TEXT")):
+                if col not in cols:
+                    self._db.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
             for name, gym_id in BUILTIN_TASKS.items():
                 self._db.execute(
                     "INSERT OR IGNORE INTO tasks (name, gym_id, description, updated_at) "
@@ -157,6 +172,39 @@ class LocalStore:
     def delete_task(self, name: str) -> None:
         self._x("DELETE FROM tasks WHERE name=?", (name,))
 
+    # ── Users (student groups; the admin is not stored here) ─────────
+    _USER_COLS = "id, username, assigned_task, created_at"
+
+    def list_users(self) -> list[dict]:
+        return self._q(f"SELECT {self._USER_COLS} FROM users ORDER BY username")
+
+    def get_user(self, uid: int) -> Optional[dict]:
+        rows = self._q(f"SELECT {self._USER_COLS} FROM users WHERE id=?", (uid,))
+        return rows[0] if rows else None
+
+    def get_user_auth(self, username: str) -> Optional[dict]:
+        rows = self._q("SELECT * FROM users WHERE username=?", (username,))
+        return rows[0] if rows else None
+
+    def create_user(self, username: str, password_hash: str,
+                    assigned_task: Optional[str]) -> int:
+        return self._x(
+            "INSERT INTO users (username, password_hash, assigned_task, created_at) "
+            "VALUES (?, ?, ?, ?)", (username, password_hash, assigned_task, _now()),
+        )
+
+    def update_user(self, uid: int, **fields) -> None:
+        if fields:
+            cols = ", ".join(f"{k}=?" for k in fields)
+            self._x(f"UPDATE users SET {cols} WHERE id=?", (*fields.values(), uid))
+
+    def delete_user(self, uid: int) -> None:
+        self._x("DELETE FROM users WHERE id=?", (uid,))
+
+    def submissions_since(self, uid: int, since_iso: str) -> int:
+        return self._q("SELECT COUNT(*) AS n FROM runs WHERE user_id=? AND created_at>=?",
+                       (uid, since_iso))[0]["n"]
+
     # ── Runs ─────────────────────────────────────────────────────────
     @staticmethod
     def _run_out(row: dict) -> dict:
@@ -164,16 +212,60 @@ class LocalStore:
         row["settings"] = json.loads(row["settings"]) if row["settings"] else None
         return row
 
-    def create_run(self, *, task_name: str, label: Optional[str], overrides: dict) -> int:
+    def create_run(self, *, task_name: str, label: Optional[str], overrides: dict,
+                   user_id: Optional[int] = None, owner: str = "admin") -> int:
         return self._x(
-            "INSERT INTO runs (task_name, label, status, overrides, created_at) "
-            "VALUES (?, ?, 'QUEUED', ?, ?)",
-            (task_name, label, json.dumps(overrides), _now()),
+            "INSERT INTO runs (task_name, label, status, overrides, user_id, owner, created_at) "
+            "VALUES (?, ?, 'QUEUED', ?, ?, ?, ?)",
+            (task_name, label, json.dumps(overrides), user_id, owner, _now()),
         )
 
-    def list_runs(self, limit: int = 200) -> list[dict]:
-        return [self._run_out(r)
-                for r in self._q("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))]
+    def list_runs(self, limit: int = 200, user_id: Optional[int] = None) -> list[dict]:
+        if user_id is None:
+            rows = self._q("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))
+        else:
+            rows = self._q("SELECT * FROM runs WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                           (user_id, limit))
+        return [self._run_out(r) for r in rows]
+
+    def leaderboard(self) -> list[dict]:
+        """Per task: every group, ranked by its best FINISHED run (higher
+        success rate first, shorter duration breaks ties). Groups without a
+        finished run on the task are listed last."""
+        users = self.list_users()
+        runs = self._q(
+            "SELECT id, user_id, task_name, status, success_rate, duration_sec, "
+            "created_at, finished_at FROM runs WHERE user_id IS NOT NULL ORDER BY id DESC")
+        boards = []
+        for task in self.list_tasks():
+            name = task["name"]
+            rows = []
+            for u in users:
+                if u["assigned_task"] not in (None, name):
+                    continue
+                mine = [r for r in runs if r["user_id"] == u["id"] and r["task_name"] == name]
+                done = [r for r in mine if r["status"] == "FINISHED" and r["success_rate"] is not None]
+                best = min(done, key=lambda r: (-r["success_rate"], r["duration_sec"] or 1e12),
+                           default=None)
+                active = next((r for r in mine if r["status"] in ("QUEUED", "RUNNING")), None)
+                if best is None and u["assigned_task"] is None and not mine:
+                    continue  # free-choice groups only show on tasks they tried
+                rows.append({
+                    "user": u["username"],
+                    "user_id": u["id"],
+                    "run_id": best["id"] if best else None,
+                    "success_rate": best["success_rate"] if best else None,
+                    "duration_sec": best["duration_sec"] if best else None,
+                    "timestamp": (best["finished_at"] or best["created_at"]) if best else None,
+                    "active_status": active["status"] if active else None,
+                    "submissions": len(mine),
+                })
+            rows.sort(key=lambda e: (e["success_rate"] is None, -(e["success_rate"] or 0),
+                                     e["duration_sec"] or 1e12, e["user"].lower()))
+            for i, e in enumerate(rows):
+                e["rank"] = i + 1
+            boards.append({"task": name, "description": task["description"], "rows": rows})
+        return boards
 
     def get_run(self, rid: int) -> Optional[dict]:
         rows = self._q("SELECT * FROM runs WHERE id=?", (rid,))

@@ -123,6 +123,8 @@ const FIELDS = [
     help: 'cpu, cuda or cuda:N inside the container (the container only sees its own GPU, as cuda:0).' },
   { key: 'action_horizon', label: 'Action horizon override', type: 'int', min: 1, step: 1, placeholder: 'from checkpoint',
     help: 'Actions executed per policy query. Empty = the checkpoint / policy default.' },
+  { key: 'daily_quota', label: 'Submissions per group per 24 h', type: 'int', min: 0, step: 1,
+    help: 'How many models each student group may submit in any 24-hour window. 0 = unlimited. Admin uploads are not counted.' },
   { key: 'record_video', label: 'Record eval video', type: 'bool',
     help: 'Save an mp4 of the run for replay. Costs some GPU time and disk.' },
 ]
@@ -140,6 +142,7 @@ function display(key, v) {
   if (v === undefined) return '…'
   if (v === null || v === '') return 'auto'
   if (typeof v === 'boolean') return v ? 'on' : 'off'
+  if (key === 'daily_quota' && Number(v) === 0) return 'unlimited'
   if (key === 'timeout_sec') return Number(v) === 0 ? 'unlimited' : `${v}s (${formatDuration(Number(v))})`
   return String(v)
 }

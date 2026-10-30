@@ -1,14 +1,14 @@
 <template>
   <div class="max-w-5xl mx-auto px-6 py-16">
     <div class="mb-10">
-      <router-link to="/runs" class="inline-flex items-center gap-2 text-sm text-gray-500 hover:text-gray-300 transition-colors mb-4">
+      <router-link to="/admin/runs" class="inline-flex items-center gap-2 text-sm text-gray-500 hover:text-gray-300 transition-colors mb-4">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
         </svg>
         Back to Runs
       </router-link>
       <h1 class="text-3xl font-bold text-white mb-2">Run #{{ id }}</h1>
-      <p class="text-gray-400">{{ run ? (run.label || run.zip_name || '—') : '...' }} · {{ taskLabel(run?.task_name) }}</p>
+      <p class="text-gray-400">{{ run?.owner || 'admin' }} · {{ run ? (run.label || run.zip_name || '—') : '...' }} · {{ taskLabel(run?.task_name) }}</p>
     </div>
 
     <div v-if="loading && !run" class="glass-card p-16 text-center">
@@ -208,11 +208,11 @@
       </div>
 
       <div class="flex gap-4 mt-8 flex-wrap">
-        <router-link to="/runs" class="btn-secondary">Back to Runs</router-link>
+        <router-link to="/admin/runs" class="btn-secondary">Back to Runs</router-link>
         <button v-if="['QUEUED', 'RUNNING'].includes(run.status)" @click="doCancel" class="btn-secondary !text-amber-300">Cancel run</button>
         <button v-if="['FINISHED', 'FAILED'].includes(run.status) && run.has_zip" @click="doRerun" class="btn-secondary">Re-run</button>
         <button v-if="!['RUNNING', 'UPLOADING'].includes(run.status)" @click="doDelete" class="btn-secondary !text-red-400">Delete</button>
-        <router-link to="/runs?submit=1" class="btn-primary ml-auto">New Evaluation</router-link>
+        <router-link to="/admin/runs?submit=1" class="btn-primary ml-auto">New Evaluation</router-link>
       </div>
     </template>
   </div>
@@ -414,7 +414,7 @@ async function doDelete() {
   try {
     await deleteRun(props.id)
     ui.toast(`Run #${props.id} deleted`)
-    router.push('/runs')
+    router.push('/admin/runs')
   } catch (err) {
     ui.toast(errorText(err), 'error')
   }

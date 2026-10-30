@@ -10,7 +10,7 @@
               <img src="/hcis-lab.png" alt="HCIS Lab" class="w-full h-full object-contain" />
             </div>
             <span class="text-xl font-bold gradient-text tracking-tighter">Physical AI</span>
-            <span class="hidden sm:inline text-[10px] font-black text-gray-500 uppercase tracking-widest mt-1">Eval Worker</span>
+            <span v-if="auth.isAdmin" class="hidden sm:inline text-[10px] font-black text-gray-500 uppercase tracking-widest mt-1">Admin</span>
           </router-link>
 
           <!-- Nav Links -->
@@ -25,8 +25,39 @@
               </router-link>
             </template>
 
-            <!-- Worker telemetry (persistent) -->
-            <div v-if="auth.me" class="hidden md:flex items-center gap-6 ml-6 pl-6 border-l border-white/10">
+            <!-- Group telemetry (persistent) — students only -->
+            <div v-if="auth.me && !auth.isAdmin && auth.stats" class="hidden md:flex items-center gap-6 ml-6 pl-6 border-l border-white/10">
+              <div class="flex flex-col">
+                <span class="text-[10px] text-gray-500 uppercase tracking-widest font-bold">Rank</span>
+                <span class="text-white font-black leading-none mt-1">
+                  <template v-if="auth.stats.rank">{{ auth.stats.rank }}<span class="text-gray-600 text-xs font-normal">/{{ auth.stats.total_groups }}</span></template>
+                  <template v-else>—</template>
+                </span>
+              </div>
+              <div class="flex flex-col">
+                <span class="text-[10px] text-gray-500 uppercase tracking-widest font-bold">Best Rate</span>
+                <span class="text-emerald-400 font-black leading-none mt-1">{{ formatRate(auth.stats.best_score) }}</span>
+              </div>
+              <div class="flex flex-col">
+                <span class="text-[10px] text-gray-500 uppercase tracking-widest font-bold">Quota</span>
+                <div v-if="auth.stats.daily_quota" class="flex gap-1.5 mt-1.5">
+                  <div v-for="i in Math.min(auth.stats.daily_quota, 10)" :key="i"
+                       class="w-2.5 h-2.5 rounded-full transition-all duration-500 shadow-sm"
+                       :class="i <= auth.stats.remaining ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : 'bg-white/5 border border-white/10'">
+                  </div>
+                </div>
+                <span v-else class="text-emerald-400 font-black leading-none mt-1">∞</span>
+              </div>
+              <div class="flex flex-col">
+                <span class="text-[10px] text-gray-500 uppercase tracking-widest font-bold">Assigned Task</span>
+                <span class="text-white font-bold leading-none mt-1 truncate max-w-[250px]">
+                  {{ auth.me.assigned_task ? taskLabel(auth.me.assigned_task) : 'Any' }}
+                </span>
+              </div>
+            </div>
+
+            <!-- Worker telemetry (persistent) — admin only -->
+            <div v-if="auth.me && auth.isAdmin" class="hidden md:flex items-center gap-6 ml-6 pl-6 border-l border-white/10">
               <div class="flex flex-col">
                 <span class="text-[10px] text-gray-500 uppercase tracking-widest font-bold">Worker</span>
                 <span class="text-white font-black leading-none mt-1 truncate max-w-[160px]">{{ auth.me.worker_name }}</span>
@@ -46,7 +77,7 @@
 
             <!-- Auth Section -->
             <div v-if="auth.isAuthenticated" class="flex items-center gap-2 ml-4 pl-4 border-l border-white/10">
-              <span class="hidden lg:inline text-sm font-medium text-brand-300">admin</span>
+              <span class="hidden lg:inline text-sm font-medium text-brand-300">{{ auth.me?.username }}</span>
               <button @click="handleLogout" class="p-2 rounded-lg text-gray-400 hover:text-red-400 hover:bg-red-400/5 transition-all duration-200" title="Logout">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
@@ -110,20 +141,27 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from './stores/auth'
 import { useUiStore } from './stores/ui'
+import { formatRate, taskLabel } from './utils/format'
 
 const auth = useAuthStore()
 const ui = useUiStore()
 const router = useRouter()
 
-const links = [
-  { to: '/runs', label: 'Runs' },
-  { to: '/tasks', label: 'Tasks' },
-  { to: '/settings', label: 'Settings' },
+const ADMIN_LINKS = [
+  { to: '/admin/runs', label: 'Runs' },
+  { to: '/admin/groups', label: 'Groups' },
+  { to: '/admin/tasks', label: 'Tasks' },
+  { to: '/admin/settings', label: 'Settings' },
 ]
+const GROUP_LINKS = [{ to: '/leaderboard', label: 'Leaderboard' }]
+const links = computed(() => (auth.isAdmin ? ADMIN_LINKS : GROUP_LINKS))
+
+// Navbar stats for a group, after a reload or a login.
+watch(() => auth.me, (me) => { if (me && !me.is_admin) auth.refreshStats() }, { immediate: true })
 
 function onExpired() {
   if (!auth.isAuthenticated) return

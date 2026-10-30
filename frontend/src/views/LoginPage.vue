@@ -7,15 +7,20 @@
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
           </svg>
         </div>
-        <h1 class="text-3xl font-bold text-white mb-2">Worker Login</h1>
-        <p class="text-gray-400">Access this school's evaluation worker</p>
+        <h1 class="text-3xl font-bold text-white mb-2">Group Login</h1>
+        <p class="text-gray-400">Access the Physical AI leaderboard</p>
       </div>
 
       <form @submit.prevent="handleLogin" class="space-y-6">
         <div>
-          <label class="block text-sm font-medium text-gray-400 mb-2">Admin Password</label>
+          <label class="block text-sm font-medium text-gray-400 mb-2">Group Name</label>
+          <input v-model="username" type="text" class="input-field" placeholder="e.g. Group 1"
+                 required autofocus id="login-username" autocomplete="username" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-400 mb-2">Password</label>
           <input v-model="password" type="password" class="input-field" placeholder="Enter password"
-                 required autofocus id="login-password" autocomplete="current-password" />
+                 required id="login-password" autocomplete="current-password" />
         </div>
 
         <button type="submit" :disabled="isSubmitting"
@@ -34,9 +39,8 @@
 
       <div class="mt-8 pt-8 border-t border-white/5 text-center">
         <p class="text-gray-500 text-xs">
-          The password is <span class="font-mono text-gray-400">WORKER_ADMIN_PASSWORD</span> in this worker's
-          <span class="font-mono text-gray-400">.env</span>,
-          <br />or printed by <span class="font-mono text-gray-400">./setup.sh</span> when it finished.
+          Each group has a daily submission limit.
+          <br />Contact instructors for account issues.
         </p>
       </div>
     </div>
@@ -53,6 +57,7 @@ const router = useRouter()
 const route = useRoute()
 const auth = useAuthStore()
 
+const username = ref('')
 const password = ref('')
 const isSubmitting = ref(false)
 const errorMsg = ref('')
@@ -61,11 +66,14 @@ async function handleLogin() {
   isSubmitting.value = true
   errorMsg.value = ''
   try {
-    await auth.login(password.value)
-    router.push(route.query.redirect || '/runs')
+    await auth.login(username.value.trim(), password.value)
+    // A redirect into the other role's pages would bounce anyway.
+    const redirect = route.query.redirect
+    const fits = redirect && redirect.startsWith('/admin') === auth.isAdmin
+    router.push(fits ? redirect : auth.home)
   } catch (err) {
     errorMsg.value = err.response?.status === 401
-      ? 'Wrong password.'
+      ? 'Wrong group name or password.'
       : errorText(err, 'Login failed.')
   } finally {
     isSubmitting.value = false

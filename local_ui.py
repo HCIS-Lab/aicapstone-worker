@@ -8,13 +8,17 @@ The UI is the Vue app in frontend/, built into ui/ by the Docker build
 (`npm run build`); this module serves it with an SPA fallback so deep
 links like /runs/12 load index.html.
 
-Auth is a single admin password (WORKER_ADMIN_PASSWORD, or generated on
-first boot into STATE_DIR/admin_password) exchanged for an HttpOnly
-session cookie.
+Two roles share one login form, exchanged for an HttpOnly session cookie:
+  * admin — username `admin`, password WORKER_ADMIN_PASSWORD (or generated
+    on first boot into STATE_DIR/admin_password). Everything.
+  * group — student accounts the admin creates. Submit to their assigned
+    task within the daily quota, see their own runs (no log, video or
+    settings) and the leaderboard.
 """
 from __future__ import annotations
 
 import ast
+import hashlib
 import hmac
 import logging
 import re
@@ -22,6 +26,8 @@ import secrets
 import shutil
 import time
 import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -46,10 +52,32 @@ _MAX_ZIP = 6 * 1024 * 1024 * 1024
 _MAX_TASK_SRC = 1024 * 1024
 _NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 _GYM_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$")
+_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$")
+_ADMIN_USER = "admin"
+_PBKDF2_ITERS = 200_000
 # Required policy files, matched by name anywhere in the zip.
 _REQUIRED_FILES = {"config.json", "model.safetensors"}
+# Fields of a run a group may see. Logs, videos and the settings snapshot
+# stay admin-only: the log can echo task internals.
+_GROUP_RUN_FIELDS = (
+    "id", "task_name", "status", "phase", "episode", "episode_total",
+    "success_rate", "policy_type", "duration_sec", "error_message",
+    "created_at", "started_at", "finished_at", "zip_name", "zip_size",
+    "queue_position", "owner",
+)
 
-_sessions: dict[str, float] = {}
+
+@dataclass(frozen=True)
+class Principal:
+    username: str
+    user_id: Optional[int]  # None = admin
+
+    @property
+    def is_admin(self) -> bool:
+        return self.user_id is None
+
+
+_sessions: dict[str, tuple[float, Principal]] = {}
 
 
 def _admin_password() -> str:
@@ -71,11 +99,60 @@ def announce_password() -> None:
                     cfg.state_dir / "admin_password", _admin_password())
 
 
-def require_login(request: Request) -> None:
-    tok = request.cookies.get(_COOKIE)
-    exp = _sessions.get(tok or "")
-    if not exp or exp < time.time():
+def hash_password(pw: str) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, _PBKDF2_ITERS)
+    return f"pbkdf2_sha256${_PBKDF2_ITERS}${salt.hex()}${dk.hex()}"
+
+
+def _verify_password(pw: str, stored: str) -> bool:
+    try:
+        _, iters, salt, want = stored.split("$")
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(iters))
+    except ValueError:
+        return False
+    return hmac.compare_digest(dk.hex(), want)
+
+
+def _drop_sessions(user_id: int) -> None:
+    for tok, (_, p) in list(_sessions.items()):
+        if p.user_id == user_id:
+            _sessions.pop(tok, None)
+
+
+def current_user(request: Request) -> Principal:
+    entry = _sessions.get(request.cookies.get(_COOKIE) or "")
+    if not entry or entry[0] < time.time():
         raise HTTPException(status_code=401, detail="login required")
+    return entry[1]
+
+
+def require_admin(user: Principal = Depends(current_user)) -> Principal:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="admin only")
+    return user
+
+
+def _quota_window_start() -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+
+
+def _group_stats(user_id: int) -> dict:
+    store = get_store()
+    quota = int(store.get_settings().get("daily_quota") or 0)
+    used = store.submissions_since(user_id, _quota_window_start())
+    best, rank, total = None, None, 0
+    u = store.get_user(user_id)
+    for board in store.leaderboard():
+        if u and u["assigned_task"] not in (None, board["task"]):
+            continue
+        for e in board["rows"]:
+            if e["user_id"] == user_id and e["success_rate"] is not None and (
+                    best is None or e["success_rate"] > best):
+                best, rank, total = e["success_rate"], e["rank"], len(board["rows"])
+    return {"daily_quota": quota, "submissions_today": used,
+            "remaining": None if quota == 0 else max(0, quota - used),
+            "best_score": best, "rank": rank, "total_groups": total}
 
 
 def _check_name(name: str) -> str:
@@ -102,7 +179,14 @@ def _clean_overrides(raw: Optional[dict]) -> dict:
 
 
 class LoginBody(BaseModel):
+    username: str = _ADMIN_USER
     password: str
+
+
+class UserBody(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    assigned_task: Optional[str] = None
 
 
 class TaskBody(BaseModel):
@@ -146,21 +230,34 @@ def mount_ui(app) -> None:
                             headers={"Cache-Control": "no-cache"})
 
 
+def _group_view(run: dict) -> dict:
+    return {k: run.get(k) for k in _GROUP_RUN_FIELDS}
+
+
 def build_router() -> APIRouter:
     r = APIRouter()
-    auth = [Depends(require_login)]
+    auth = [Depends(require_admin)]
 
     # ── Session ──────────────────────────────────────────────────────
     @r.post("/api/login")
     def login(body: LoginBody, response: Response):
-        if not hmac.compare_digest(body.password.encode(), _admin_password().encode()):
+        name = body.username.strip()
+        principal = None
+        if name.lower() == _ADMIN_USER:
+            if hmac.compare_digest(body.password.encode(), _admin_password().encode()):
+                principal = Principal(_ADMIN_USER, None)
+        else:
+            u = get_store().get_user_auth(name)
+            if u and _verify_password(body.password, u["password_hash"]):
+                principal = Principal(u["username"], u["id"])
+        if principal is None:
             time.sleep(1)  # slow down guessing
-            raise HTTPException(status_code=401, detail="wrong password")
+            raise HTTPException(status_code=401, detail="wrong name or password")
         tok = secrets.token_urlsafe(32)
-        _sessions[tok] = time.time() + _SESSION_TTL
+        _sessions[tok] = (time.time() + _SESSION_TTL, principal)
         response.set_cookie(_COOKIE, tok, max_age=_SESSION_TTL,
                             httponly=True, samesite="strict")
-        return {"ok": True}
+        return {"ok": True, "username": principal.username, "is_admin": principal.is_admin}
 
     @r.post("/api/logout")
     def logout(request: Request, response: Response):
@@ -168,10 +265,99 @@ def build_router() -> APIRouter:
         response.delete_cookie(_COOKIE)
         return {"ok": True}
 
-    @r.get("/api/me", dependencies=auth)
-    def me():
-        return {"worker_name": cfg.worker_name, "eval_mode": cfg.eval_mode,
-                "gpu_id": cfg.gpu_id}
+    @r.get("/api/me")
+    def me(user: Principal = Depends(current_user)):
+        out = {"username": user.username, "is_admin": user.is_admin,
+               "worker_name": cfg.worker_name, "eval_mode": cfg.eval_mode}
+        if user.is_admin:
+            out["gpu_id"] = cfg.gpu_id
+        else:
+            u = get_store().get_user(user.user_id)
+            if u is None:  # deleted while logged in
+                raise HTTPException(status_code=401, detail="account removed")
+            out["assigned_task"] = u["assigned_task"]
+        return out
+
+    @r.get("/api/me/stats")
+    def my_stats(user: Principal = Depends(current_user)):
+        if user.is_admin:
+            raise HTTPException(status_code=404, detail="admins have no group stats")
+        return _group_stats(user.user_id)
+
+    @r.get("/api/leaderboard")
+    def leaderboard(user: Principal = Depends(current_user)):
+        boards = get_store().leaderboard()
+        for b in boards:
+            for e in b["rows"]:
+                # Groups open only their own runs.
+                e["mine"] = e["user_id"] == user.user_id
+                if not (user.is_admin or e["mine"]):
+                    e["run_id"] = None
+                e.pop("user_id")
+        return boards
+
+    # ── Groups (student accounts) ────────────────────────────────────
+    def _task_or_none(name: Optional[str]) -> Optional[str]:
+        name = (name or "").strip() or None
+        if name and get_store().get_task(name) is None:
+            raise HTTPException(status_code=400, detail=f"unknown task '{name}'")
+        return name
+
+    def _check_password(pw: str) -> str:
+        if len(pw) < 6:
+            raise HTTPException(status_code=400, detail="password: at least 6 characters")
+        return pw
+
+    @r.get("/api/users", dependencies=auth)
+    def list_users():
+        store = get_store()
+        since = _quota_window_start()
+        runs = store.list_runs(limit=100000)
+        out = []
+        for u in store.list_users():
+            mine = [x for x in runs if x["user_id"] == u["id"]]
+            scores = [x["success_rate"] for x in mine
+                      if x["status"] == "FINISHED" and x["success_rate"] is not None]
+            out.append({**u, "submissions": len(mine),
+                        "submissions_today": store.submissions_since(u["id"], since),
+                        "best_score": max(scores, default=None),
+                        "last_submission": mine[0]["created_at"] if mine else None})
+        return out
+
+    @r.post("/api/users", dependencies=auth)
+    def create_user(body: UserBody):
+        name = (body.username or "").strip()
+        if not _USER_RE.match(name) or name.lower() == _ADMIN_USER:
+            raise HTTPException(status_code=400,
+                                detail="group name: letters, digits, space _ . - (max 40), not 'admin'")
+        store = get_store()
+        if store.get_user_auth(name):
+            raise HTTPException(status_code=409, detail=f"'{name}' already exists")
+        pw = _check_password(body.password) if body.password else secrets.token_urlsafe(8)
+        uid = store.create_user(name, hash_password(pw), _task_or_none(body.assigned_task))
+        # The only time the password is returned; it is stored hashed.
+        return {**store.get_user(uid), "password": pw}
+
+    @r.put("/api/users/{uid}", dependencies=auth)
+    def update_user(uid: int, body: UserBody):
+        store = get_store()
+        if store.get_user(uid) is None:
+            raise HTTPException(status_code=404, detail="no such group")
+        fields = {}
+        if "assigned_task" in body.model_fields_set:
+            fields["assigned_task"] = _task_or_none(body.assigned_task)
+        if body.password:
+            fields["password_hash"] = hash_password(_check_password(body.password))
+            _drop_sessions(uid)
+        store.update_user(uid, **fields)
+        return store.get_user(uid)
+
+    @r.delete("/api/users/{uid}", dependencies=auth)
+    def delete_user(uid: int):
+        # Their runs stay (with the owner name) for the record.
+        get_store().delete_user(uid)
+        _drop_sessions(uid)
+        return {"ok": True}
 
     # ── Settings ─────────────────────────────────────────────────────
     @r.get("/api/settings", dependencies=auth)
@@ -201,15 +387,18 @@ def build_router() -> APIRouter:
                     num = float(v)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail=f"{k} must be a number")
-                if num < 0 or (num == 0 and k != "timeout_sec"):
+                if num < 0 or (num == 0 and k not in ("timeout_sec", "daily_quota")):
                     raise HTTPException(status_code=400, detail=f"{k} out of range")
                 clean[k] = num if k == "episode_length_s" else int(num)
         return get_store().put_settings(clean)
 
     # ── Tasks ────────────────────────────────────────────────────────
-    @r.get("/api/tasks", dependencies=auth)
-    def list_tasks():
-        return get_store().list_tasks()
+    @r.get("/api/tasks")
+    def list_tasks(user: Principal = Depends(current_user)):
+        tasks = get_store().list_tasks()
+        if not user.is_admin:
+            tasks = [{k: t[k] for k in ("name", "description", "kind")} for t in tasks]
+        return tasks
 
     @r.get("/api/tasks/{name}", dependencies=auth)
     def get_task(name: str):
@@ -252,30 +441,52 @@ def build_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="no such run")
         return run
 
-    @r.get("/api/runs", dependencies=auth)
-    def list_runs():
-        runs = _with_file_flags(get_store().list_runs())
-        return {"current": local_runner.current_run(), "runs": runs}
+    @r.get("/api/runs")
+    def list_runs(user: Principal = Depends(current_user)):
+        if user.is_admin:
+            runs = _with_file_flags(get_store().list_runs())
+            return {"current": local_runner.current_run(), "runs": runs}
+        runs = _with_file_flags(get_store().list_runs(user_id=user.user_id))
+        return {"runs": [_group_view(x) for x in runs]}
 
-    @r.get("/api/runs/{rid}", dependencies=auth)
-    def get_run(rid: int):
-        return _with_file_flags([_run_or_404(rid)])[0]
+    @r.get("/api/runs/{rid}")
+    def get_run(rid: int, user: Principal = Depends(current_user)):
+        run = _run_or_404(rid)
+        if not user.is_admin and run["user_id"] != user.user_id:
+            raise HTTPException(status_code=404, detail="no such run")
+        run = _with_file_flags([run])[0]
+        return run if user.is_admin else _group_view(run)
 
-    @r.post("/api/runs", dependencies=auth)
+    @r.post("/api/runs")
     async def create_run(
         file: UploadFile = File(...),
         task_name: str = Form(...),
         label: str = Form(""),
         eval_rounds: str = Form(""),
         episode_length_s: str = Form(""),
+        user: Principal = Depends(current_user),
     ):
         store = get_store()
         if store.get_task(task_name) is None:
             raise HTTPException(status_code=400, detail=f"unknown task '{task_name}'")
-        overrides = _clean_overrides({"eval_rounds": eval_rounds,
-                                      "episode_length_s": episode_length_s})
+        if user.is_admin:
+            overrides = _clean_overrides({"eval_rounds": eval_rounds,
+                                          "episode_length_s": episode_length_s})
+        else:
+            u = store.get_user(user.user_id)
+            if u is None:
+                raise HTTPException(status_code=401, detail="account removed")
+            if u["assigned_task"] and task_name != u["assigned_task"]:
+                raise HTTPException(status_code=403,
+                                    detail=f"your group is assigned to '{u['assigned_task']}'")
+            stats = _group_stats(user.user_id)
+            if stats["remaining"] == 0:
+                raise HTTPException(status_code=429,
+                                    detail=f"daily quota used ({stats['daily_quota']} per 24 h)")
+            overrides, label = {}, ""  # groups can't change how they are graded
         rid = store.create_run(task_name=task_name, label=label.strip() or None,
-                               overrides=overrides)
+                               overrides=overrides, user_id=user.user_id,
+                               owner=user.username)
         # Not claimable until the zip is in place.
         store.update_run(rid, status="UPLOADING")
         tmp = submission_dir(rid) / "pretrained_model.zip.part"
@@ -302,7 +513,8 @@ def build_router() -> APIRouter:
             raise
         tmp.rename(zip_path_for(rid))
         store.update_run(rid, status="QUEUED", zip_name=file.filename, zip_size=total)
-        return store.get_run(rid)
+        run = store.get_run(rid)
+        return run if user.is_admin else _group_view(run)
 
     @r.get("/api/runs/{rid}/log", dependencies=auth)
     def run_log(rid: int, tail: int = 300):

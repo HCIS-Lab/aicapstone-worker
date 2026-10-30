@@ -30,9 +30,17 @@ export function errorText(err, fallback = 'Request failed') {
 }
 
 // Session
-export const login = (password) => api.post('/login', { password })
+export const login = (username, password) => api.post('/login', { username, password })
 export const logout = () => api.post('/logout')
 export const getMe = () => api.get('/me')
+export const getMyStats = () => api.get('/me/stats')
+export const getLeaderboard = () => api.get('/leaderboard')
+
+// Groups (student accounts) — admin
+export const listUsers = () => api.get('/users')
+export const createUser = (body) => api.post('/users', body)
+export const updateUser = (id, body) => api.put(`/users/${id}`, body)
+export const deleteUser = (id) => api.delete(`/users/${id}`)
 
 // Settings
 export const getSettings = () => api.get('/settings')
