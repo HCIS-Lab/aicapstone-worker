@@ -172,17 +172,23 @@ RUN python -m pip install --upgrade \
         toml==0.10.2 \
         packaging==24.2
 
-# Newer pyarrow (e.g. 26) requires NumPy 2; Isaac Sim needs numpy 1.26, and datasets (LeRobot) needs pyarrow>=21.
-RUN printf "numpy==1.26.0\npyarrow==21.0.0\n" > /tmp/sim-constraints.txt \
+# Isaac Sim needs numpy 1.26, so everything that links against numpy is
+# pinned to the last release that still accepts it: newer pyarrow (e.g. 26)
+# and pandas after 3.0.6 require NumPy >= 2, and datasets (LeRobot) pulls
+# both in. Unpinned, a fresh build picks them up and every eval dies at
+# `import lerobot` with "Please upgrade numpy to >= 2.0.2".
+RUN printf "numpy==1.26.0\npyarrow==21.0.0\npandas==3.0.6\ndatasets==4.8.5\n" > /tmp/sim-constraints.txt \
     && python -m pip install --use-deprecated=legacy-resolver \
         --no-build-isolation \
         -c /tmp/sim-constraints.txt \
         -e packages/simulator \
-    && python -m pip install --no-deps numpy==1.26.0 \
+    && python -m pip install --no-deps \
+        numpy==1.26.0 pyarrow==21.0.0 pandas==3.0.6 datasets==4.8.5 \
     && rm -f /tmp/sim-constraints.txt
 
 RUN python -m pip install --upgrade pip==26.0.1 \
-    && python -m pip install --no-deps numpy==1.26.0
+    && python -m pip install --no-deps numpy==1.26.0 \
+    && python -c "import numpy, pyarrow, pandas, datasets; assert numpy.__version__ == '1.26.0', numpy.__version__"
 
 # The simulator install can drag in cuda-bindings[all] → cuda-toolkit 13 and the
 # CUDA 13 nvidia-* wheels. They share nvidia/<lib>/lib with torch's cu12 wheels and
