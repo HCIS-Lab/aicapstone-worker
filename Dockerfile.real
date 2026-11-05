@@ -216,6 +216,7 @@ RUN mkdir -p /root/.cache/ov \
  && rm /tmp/ov-cache.tgz
 
 COPY *.py /app/worker_agent/
+COPY default_tasks/ /app/worker_agent/default_tasks/
 COPY --from=ui /ui/dist/ /app/worker_agent/ui/
 
 WORKDIR /app

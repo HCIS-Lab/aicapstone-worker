@@ -18,7 +18,9 @@ Two roles share one login form, exchanged for an HttpOnly session cookie:
 from __future__ import annotations
 
 import ast
+import csv
 import hashlib
+import io
 import hmac
 import logging
 import re
@@ -40,7 +42,9 @@ from pydantic import BaseModel
 
 from worker_agent import local_runner
 from worker_agent.config import cfg
-from worker_agent.local_store import DEFAULT_SETTINGS, OVERRIDE_KEYS, get_store
+from worker_agent.local_store import (
+    DEFAULT_SETTINGS, OVERRIDE_KEYS, default_tasks, get_store,
+)
 from worker_agent.storage import submission_dir, video_path_for, zip_path_for
 
 log = logging.getLogger("worker.ui")
@@ -54,6 +58,9 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 _GYM_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$")
 _USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$")
 _ADMIN_USER = "admin"
+# First boot: two groups per default task.
+_DEFAULT_GROUPS_PER_TASK = 2
+_SEED_MARK = "defaults_seeded"
 _PBKDF2_ITERS = 200_000
 # Required policy files, matched by name anywhere in the zip.
 _REQUIRED_FILES = {"config.json", "model.safetensors"}
@@ -97,6 +104,64 @@ def announce_password() -> None:
     else:
         log.warning("UI login password (generated, stored in %s): %s",
                     cfg.state_dir / "admin_password", _admin_password())
+
+
+def _initial_file() -> Path:
+    return cfg.state_dir / "initial_groups.csv"
+
+
+def _read_initial() -> list[dict]:
+    try:
+        text = _initial_file().read_text()
+    except FileNotFoundError:
+        return []
+    return list(csv.DictReader(io.StringIO(text)))
+
+
+def _write_initial(rows: list[dict]) -> None:
+    f = _initial_file()
+    if not rows:
+        f.unlink(missing_ok=True)
+        return
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["group", "password", "task"])
+    w.writeheader()
+    w.writerows(rows)
+    f.write_text(buf.getvalue())
+    f.chmod(0o600)
+
+
+def _forget_initial(username: str) -> None:
+    """A group's generated password stops being shown once it changes."""
+    rows = _read_initial()
+    keep = [r for r in rows if r["group"] != username]
+    if len(keep) != len(rows):
+        _write_initial(keep)
+
+
+def seed_defaults() -> None:
+    """First boot only: load the repo's default tasks and create
+    _DEFAULT_GROUPS_PER_TASK groups per task with generated passwords
+    (kept in STATE_DIR/initial_groups.csv for the admin's Groups page).
+    Later boots leave everything alone, so deletions stick."""
+    store = get_store()
+    if store.get_meta(_SEED_MARK):
+        return
+    added = store.seed_default_tasks()
+    if added:
+        log.info("default tasks loaded: %s", ", ".join(added))
+    if not store.list_users():
+        rows, n = [], 0
+        for t in default_tasks():
+            for _ in range(_DEFAULT_GROUPS_PER_TASK):
+                n += 1
+                name, pw = f"Group {n}", secrets.token_urlsafe(8)
+                store.create_user(name, hash_password(pw), t["name"])
+                rows.append({"group": name, "password": pw, "task": t["name"]})
+        _write_initial(rows)
+        log.warning("created %d default groups; passwords on the admin Groups page "
+                    "and in %s", n, _initial_file())
+    store.set_meta(_SEED_MARK, "1")
 
 
 def hash_password(pw: str) -> str:
@@ -324,12 +389,16 @@ def build_router() -> APIRouter:
                         "last_submission": mine[0]["created_at"] if mine else None})
         return out
 
-    @r.post("/api/users", dependencies=auth)
-    def create_user(body: UserBody):
-        name = (body.username or "").strip()
+    def _check_group_name(raw: Optional[str]) -> str:
+        name = (raw or "").strip()
         if not _USER_RE.match(name) or name.lower() == _ADMIN_USER:
             raise HTTPException(status_code=400,
                                 detail="group name: letters, digits, space _ . - (max 40), not 'admin'")
+        return name
+
+    @r.post("/api/users", dependencies=auth)
+    def create_user(body: UserBody):
+        name = _check_group_name(body.username)
         store = get_store()
         if store.get_user_auth(name):
             raise HTTPException(status_code=409, detail=f"'{name}' already exists")
@@ -341,13 +410,27 @@ def build_router() -> APIRouter:
     @r.put("/api/users/{uid}", dependencies=auth)
     def update_user(uid: int, body: UserBody):
         store = get_store()
-        if store.get_user(uid) is None:
+        user = store.get_user(uid)
+        if user is None:
             raise HTTPException(status_code=404, detail="no such group")
         fields = {}
+        if body.username is not None and body.username.strip() != user["username"]:
+            name = _check_group_name(body.username)
+            other = store.get_user_auth(name)
+            if other and other["id"] != uid:
+                raise HTTPException(status_code=409, detail=f"'{name}' already exists")
+            fields["username"] = name
+            rows = _read_initial()
+            for row in rows:
+                if row["group"] == user["username"]:
+                    row["group"] = name
+            _write_initial(rows)
+            _drop_sessions(uid)  # sessions carry the old name
         if "assigned_task" in body.model_fields_set:
             fields["assigned_task"] = _task_or_none(body.assigned_task)
         if body.password:
             fields["password_hash"] = hash_password(_check_password(body.password))
+            _forget_initial(fields.get("username", user["username"]))
             _drop_sessions(uid)
         store.update_user(uid, **fields)
         return store.get_user(uid)
@@ -355,8 +438,22 @@ def build_router() -> APIRouter:
     @r.delete("/api/users/{uid}", dependencies=auth)
     def delete_user(uid: int):
         # Their runs stay (with the owner name) for the record.
-        get_store().delete_user(uid)
+        store = get_store()
+        user = store.get_user(uid)
+        store.delete_user(uid)
+        if user:
+            _forget_initial(user["username"])
         _drop_sessions(uid)
+        return {"ok": True}
+
+    @r.get("/api/initial-credentials", dependencies=auth)
+    def initial_credentials():
+        """Generated passwords of the first-boot groups that still use them."""
+        return _read_initial()
+
+    @r.delete("/api/initial-credentials", dependencies=auth)
+    def hide_initial_credentials():
+        _write_initial([])
         return {"ok": True}
 
     # ── Settings ─────────────────────────────────────────────────────
@@ -399,6 +496,11 @@ def build_router() -> APIRouter:
         if not user.is_admin:
             tasks = [{k: t[k] for k in ("name", "description", "kind")} for t in tasks]
         return tasks
+
+    @r.get("/api/default-tasks", dependencies=auth)
+    def list_default_tasks():
+        """The repo's default_tasks/ files, to restore or re-add one."""
+        return default_tasks()
 
     @r.get("/api/tasks/{name}", dependencies=auth)
     def get_task(name: str):

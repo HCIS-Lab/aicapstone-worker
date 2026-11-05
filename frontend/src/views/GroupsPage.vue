@@ -9,6 +9,36 @@
       <button @click="fetchUsers()" class="btn-secondary text-sm">Refresh</button>
     </div>
 
+    <!-- First-boot accounts -->
+    <div v-if="initial.length" class="glass-card p-6 mb-8 border border-emerald-500/20">
+      <div class="flex items-start justify-between gap-4 flex-wrap mb-4">
+        <div>
+          <h3 class="text-sm font-black text-white uppercase tracking-widest flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-emerald-500"></span> Default accounts
+          </h3>
+          <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">
+            Created on first start, two groups per default task. Hand these out to the students.
+            A group drops off this list once you reset its password or delete it; Hide removes the list for good.
+          </p>
+        </div>
+        <div class="flex gap-2">
+          <button @click="copyCsv(initial.map(c => ({ username: c.group, password: c.password, task: c.task })))"
+                  class="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 text-[10px] font-black text-emerald-300 uppercase tracking-widest hover:text-white">
+            {{ copied === 'initial' ? 'Copied' : 'Copy CSV' }}
+          </button>
+          <button @click="hideInitial"
+                  class="px-4 py-2 rounded-xl bg-white/5 border border-white/10 text-[10px] font-black text-gray-400 uppercase tracking-widest hover:text-white">Hide</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+        <div v-for="c in initial" :key="c.group" class="rounded-xl bg-surface-900 border border-white/5 p-4">
+          <div class="text-white font-bold text-sm">{{ c.group }}</div>
+          <div class="text-emerald-300 font-mono text-sm mt-1 select-all">{{ c.password }}</div>
+          <div class="text-[10px] text-gray-500 mt-2 uppercase tracking-widest font-black">{{ taskLabel(c.task) }}</div>
+        </div>
+      </div>
+    </div>
+
     <div class="grid grid-cols-1 xl:grid-cols-3 gap-8">
       <!-- Add groups -->
       <div class="glass-card p-6 h-fit">
@@ -41,7 +71,7 @@
           <div class="flex items-center justify-between mb-3">
             <div class="text-[10px] font-black text-emerald-400 uppercase tracking-widest">Credentials — shown once</div>
             <div class="flex gap-3">
-              <button @click="copyIssued" class="text-[10px] font-black text-emerald-300 uppercase tracking-widest hover:text-white">{{ copied ? 'Copied' : 'Copy CSV' }}</button>
+              <button @click="copyCsv(issued)" class="text-[10px] font-black text-emerald-300 uppercase tracking-widest hover:text-white">{{ copied === 'issued' ? 'Copied' : 'Copy CSV' }}</button>
               <button @click="issued = []" class="text-[10px] font-black text-gray-500 uppercase tracking-widest hover:text-white">Clear</button>
             </div>
           </div>
@@ -87,7 +117,18 @@
               </td>
             </tr>
             <tr v-for="u in users" :key="u.id" class="hover:bg-white/[0.02]">
-              <td class="px-4 py-3 text-white font-bold text-sm">{{ u.username }}</td>
+              <td class="px-4 py-3 text-sm">
+                <input v-if="renaming?.id === u.id" v-model="renaming.name" maxlength="40"
+                       @keydown.enter="saveRename(u)" @keydown.esc="renaming = null" @blur="saveRename(u)"
+                       class="w-36 bg-surface-950 border border-brand-500 rounded-lg px-2 py-1 text-sm text-white outline-none" />
+                <button v-else @click="startRename(u)" title="Rename"
+                        class="text-white font-bold hover:text-brand-300 inline-flex items-center gap-1.5 group/name">
+                  {{ u.username }}
+                  <svg class="w-3 h-3 text-gray-600 group-hover/name:text-brand-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536M9 13l6.232-6.232a2.5 2.5 0 113.536 3.536L12.536 16.536 9 17l.464-3.536z" />
+                  </svg>
+                </button>
+              </td>
               <td class="px-4 py-3">
                 <select :value="u.assigned_task || ''" @change="changeTask(u, $event.target.value)"
                         class="bg-surface-950 border border-white/10 rounded-lg px-2 py-1 text-xs text-gray-200 focus:border-brand-500 outline-none">
@@ -120,9 +161,10 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import {
-  listUsers, createUser, updateUser, deleteUser, listTasks, getSettings, errorText,
+  listUsers, createUser, updateUser, deleteUser, listTasks, getSettings,
+  getInitialCredentials, hideInitialCredentials, errorText,
 } from '../api'
 import { useUiStore } from '../stores/ui'
 import { formatLocal } from '../utils/datetime'
@@ -140,14 +182,18 @@ const bulkTask = ref('')
 const adding = ref(false)
 const issued = ref([])
 const addErrors = ref([])
-const copied = ref(false)
+const copied = ref('')
+const initial = ref([])     // first-boot groups still on their generated password
+const renaming = ref(null)  // { id, name }
 
 const bulkLines = computed(() =>
   bulk.value.split('\n').map(l => l.trim()).filter(Boolean))
 
 async function fetchUsers() {
   try {
-    users.value = (await listUsers()).data
+    const [u, i] = await Promise.all([listUsers(), getInitialCredentials()])
+    users.value = u.data
+    initial.value = i.data
   } catch (err) {
     ui.toast(errorText(err, 'Failed to load groups'), 'error')
   } finally {
@@ -176,15 +222,54 @@ async function addGroups() {
   fetchUsers()
 }
 
-async function copyIssued() {
-  const csv = ['group,password', ...issued.value.map(c => `${c.username},${c.password}`)].join('\n')
+async function copyCsv(rows) {
+  const withTask = rows.some(c => c.task)
+  const csv = [withTask ? 'group,password,task' : 'group,password',
+    ...rows.map(c => [c.username, c.password, ...(withTask ? [c.task] : [])].join(','))].join('\n')
   try {
     await navigator.clipboard.writeText(csv)
-    copied.value = true
-    setTimeout(() => { copied.value = false }, 1500)
+    copied.value = rows === issued.value ? 'issued' : 'initial'
+    setTimeout(() => { copied.value = '' }, 1500)
   } catch {
-    ui.toast('Clipboard not available; select the table instead', 'error')
+    ui.toast('Clipboard not available; select the passwords instead', 'error')
   }
+}
+
+async function hideInitial() {
+  const ok = await ui.confirm({
+    title: 'Hide the default account passwords?',
+    message: 'They are not stored anywhere else. Copy them first if the students do not have them yet; Reset gives a group a new one.',
+    danger: true,
+    acceptLabel: 'Hide for good',
+  })
+  if (!ok) return
+  try {
+    await hideInitialCredentials()
+    initial.value = []
+  } catch (err) {
+    ui.toast(errorText(err), 'error')
+  }
+}
+
+async function startRename(u) {
+  renaming.value = { id: u.id, name: u.username }
+  await nextTick()
+  document.querySelector('td input[maxlength="40"]')?.focus()
+}
+
+async function saveRename(u) {
+  const r = renaming.value
+  if (!r || r.id !== u.id) return
+  renaming.value = null
+  const name = r.name.trim()
+  if (!name || name === u.username) return
+  try {
+    await updateUser(u.id, { username: name })
+    ui.toast(`${u.username} renamed to ${name}; the group signs in with the new name`)
+  } catch (err) {
+    ui.toast(errorText(err, 'Rename failed'), 'error')
+  }
+  fetchUsers()
 }
 
 async function changeTask(u, task) {
@@ -207,7 +292,7 @@ function newPassword() {
 async function resetPassword(u) {
   const ok = await ui.confirm({
     title: `Reset password for ${u.username}?`,
-    message: 'A new password is generated and shown once. The group is signed out everywhere.',
+    message: 'A new password is generated and shown once, in the credentials box. The group is signed out everywhere.',
     acceptLabel: 'Reset',
   })
   if (!ok) return

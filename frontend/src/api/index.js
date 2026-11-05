@@ -41,6 +41,8 @@ export const listUsers = () => api.get('/users')
 export const createUser = (body) => api.post('/users', body)
 export const updateUser = (id, body) => api.put(`/users/${id}`, body)
 export const deleteUser = (id) => api.delete(`/users/${id}`)
+export const getInitialCredentials = () => api.get('/initial-credentials')
+export const hideInitialCredentials = () => api.delete('/initial-credentials')
 
 // Settings
 export const getSettings = () => api.get('/settings')
@@ -51,6 +53,7 @@ export const updateSettings = (body) => api.put('/settings', body)
 export const listTasks = () => api.get('/tasks')
 export const getTask = (name) => api.get(`/tasks/${encodeURIComponent(name)}`)
 export const saveTask = (name, body) => api.put(`/tasks/${encodeURIComponent(name)}`, body)
+export const listDefaultTasks = () => api.get('/default-tasks')
 export const deleteTask = (name) => api.delete(`/tasks/${encodeURIComponent(name)}`)
 
 // Runs

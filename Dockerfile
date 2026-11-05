@@ -21,6 +21,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./worker_agent/
+COPY default_tasks/ ./worker_agent/default_tasks/
 COPY --from=ui /ui/dist/ ./worker_agent/ui/
 
 RUN mkdir -p /var/lib/worker-agent/storage /var/lib/worker-agent/state

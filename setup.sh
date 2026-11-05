@@ -360,8 +360,19 @@ say "${GRN}Worker \"${WORKER_NAME}\" is up (${MODE} mode).${RST}"
 say ""
 say "Open the eval UI:  ${BOLD}http://$(hostname -I 2>/dev/null | awk '{print $1}'):${HOST_PORT}/${RST}"
 say "Admin login:       ${BOLD}admin${RST} / ${BOLD}${ADMIN_PASSWORD}${RST}   (WORKER_ADMIN_PASSWORD in .env)"
+# First start creates 2 student groups per default task; their generated
+# passwords stay readable (admin Groups page) until changed or hidden.
+creds=$(docker compose exec -T worker-agent cat /var/lib/worker-agent/state/initial_groups.csv 2>/dev/null || true)
+if [[ -n "$creds" ]]; then
+  say ""
+  say "Student accounts (also on the admin Groups page):"
+  echo "$creds" | tail -n +2 | while IFS=, read -r g p t; do
+    say "  ${BOLD}${g}${RST}  ${p}   (${t})"
+  done
+fi
 say ""
-say "Define tasks + eval settings there, then upload policy zips to evaluate."
+say "Default tasks: cup_stacking, cutlery_arrangement, toy_blocks_collection."
+say "Edit tasks, groups and eval settings in the UI, then students submit from the leaderboard."
 say ""
 say "Useful commands:"
 say "  ${BLU}docker compose logs -f${RST}          tail live logs"

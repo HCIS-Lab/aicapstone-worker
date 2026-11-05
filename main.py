@@ -20,7 +20,7 @@ import threading
 from worker_agent import local_runner
 from worker_agent.config import cfg
 from worker_agent.local_store import get_store
-from worker_agent.local_ui import announce_password
+from worker_agent.local_ui import announce_password, seed_defaults
 from worker_agent.server import app
 
 logging.basicConfig(
@@ -47,6 +47,7 @@ def _startup():
 
     cfg.check_or_die()
     get_store()
+    seed_defaults()
     announce_password()
     t = threading.Thread(target=local_runner.run_loop, args=(_stop_flag,),
                          name="local_run_loop", daemon=True)

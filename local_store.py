@@ -9,10 +9,12 @@ global settings > DEFAULT_SETTINGS.
 """
 from __future__ import annotations
 
+import ast
 import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from worker_agent.config import cfg
@@ -27,18 +29,39 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "daily_quota": 3,          # submissions per group per 24 h; 0 = unlimited
 }
 
-# Tasks that ship with the simulator package; `--task` takes the gym id
-# directly, no config file needed. Schools add their own as .py configs.
-BUILTIN_TASKS = {
+# Eval configs that ship in the repo (default_tasks/<name>.py). They are
+# copied into the database once, on first boot; after that the admin
+# edits, deletes or re-adds them in the UI.
+DEFAULT_TASKS_DIR = Path(__file__).parent / "default_tasks"
+
+# Gym ids an older worker seeded as tasks; first boot after the update
+# swaps an unedited one for its default_tasks/ file.
+_LEGACY_BUILTIN = {
     "cup_stacking": "HCIS-CupStacking-SingleArm-v0",
     "cutlery_arrangement": "HCIS-CutleryArrangement-SingleArm-v0",
     "toy_blocks_collection": "HCIS-ToyBlocksCollection-SingleArm-v0",
 }
 
+
+def default_tasks() -> list[dict]:
+    """[{name, description, content}] from default_tasks/, sorted by name.
+    The description is the first line of the file's docstring."""
+    out = []
+    for f in sorted(DEFAULT_TASKS_DIR.glob("*.py")):
+        content = f.read_text(encoding="utf-8")
+        doc = ast.get_docstring(ast.parse(content)) or ""
+        out.append({"name": f.stem, "description": doc.split("\n", 1)[0].strip(),
+                    "content": content})
+    return out
+
 # Per-task and per-run overrides of the global settings.
 OVERRIDE_KEYS = ("eval_rounds", "episode_length_s")
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -100,12 +123,6 @@ class LocalStore:
             for col, typ in (("user_id", "INTEGER"), ("owner", "TEXT")):
                 if col not in cols:
                     self._db.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
-            for name, gym_id in BUILTIN_TASKS.items():
-                self._db.execute(
-                    "INSERT OR IGNORE INTO tasks (name, gym_id, description, updated_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (name, gym_id, "built-in simulator task", _now()),
-                )
             # A run can't still be going after a restart; its Isaac Sim
             # process (or upload) died with the old container.
             self._db.execute(
@@ -120,6 +137,30 @@ class LocalStore:
     def _x(self, sql: str, args: tuple = ()) -> int:
         with self._lock, self._db:
             return self._db.execute(sql, args).lastrowid
+
+    # ── Meta (one-time markers) ──────────────────────────────────────
+    def get_meta(self, key: str) -> Optional[str]:
+        rows = self._q("SELECT value FROM meta WHERE key=?", (key,))
+        return rows[0]["value"] if rows else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._x("INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def seed_default_tasks(self) -> list[str]:
+        """Add default_tasks/ that aren't in the database yet; replace an
+        unedited legacy built-in row. Returns the names written."""
+        written = []
+        for t in default_tasks():
+            cur = self.get_task(t["name"])
+            legacy = (cur is not None and not cur["content"]
+                      and cur["gym_id"] == _LEGACY_BUILTIN.get(t["name"])
+                      and not cur["overrides"])
+            if cur is None or legacy:
+                self.put_task(t["name"], gym_id=None, content=t["content"],
+                              description=t["description"], overrides={})
+                written.append(t["name"])
+        return written
 
     # ── Settings ─────────────────────────────────────────────────────
     def get_settings(self) -> dict:
@@ -197,6 +238,8 @@ class LocalStore:
         if fields:
             cols = ", ".join(f"{k}=?" for k in fields)
             self._x(f"UPDATE users SET {cols} WHERE id=?", (*fields.values(), uid))
+        if "username" in fields:  # runs list the group by name
+            self._x("UPDATE runs SET owner=? WHERE user_id=?", (fields["username"], uid))
 
     def delete_user(self, uid: int) -> None:
         self._x("DELETE FROM users WHERE id=?", (uid,))

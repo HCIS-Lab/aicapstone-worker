@@ -67,8 +67,20 @@ When it finishes it prints:
 
 ```
 Open the eval UI:  http://<host-ip>:8081/
-Admin password:    ...
+Admin login:       admin / ...
+
+Student accounts (also on the admin Groups page):
+  Group 1  q5LVUz1McTQ   (cup_stacking)
+  Group 2  YszWIosDZYM   (cup_stacking)
+  Group 3  ...           (cutlery_arrangement)
+  ...
 ```
+
+It is usable straight away. On first start the worker loads three default
+tasks from [`default_tasks/`](./default_tasks) (`cup_stacking`,
+`cutlery_arrangement`, `toy_blocks_collection`) and creates six student
+groups, two per task, with generated passwords. All of it can be edited,
+deleted or extended in the UI afterwards.
 
 **More GPUs on one host:** one clone per GPU (`git clone … worker-gpu1`,
 `cd worker-gpu1 && ./setup.sh`); each picks its own GPU, port and
@@ -90,8 +102,8 @@ ranking.
 | Admin tab | What you can do |
 |---|---|
 | **Runs** | Upload a policy zip, pick the task, optionally override episodes / episode length for this run. Watch the queue, live progress and log; cancel, re-run, delete; replay the recorded video |
-| **Groups** | Create student group accounts (one per line; passwords generated or given, shown once), assign each a task or let it choose, reset passwords, delete |
-| **Tasks** | Built-in tasks are pre-loaded: `cup_stacking`, `cutlery_arrangement`, `toy_blocks_collection`. Add your own by pasting or uploading an eval config `.py`, or by entering any registered gym id. Each task can set its own episodes and episode length |
+| **Groups** | The six default groups and their passwords (until you reset them or hide the list). Add groups (one per line; passwords generated or given, shown once), rename, change the assigned task or let a group choose, reset passwords, delete |
+| **Tasks** | The three default tasks as editable eval configs. Edit the `.py`, restore the repo version, delete, re-add a deleted default, or add your own (paste / upload a `.py`, start from a default, or enter any registered gym id). Each task can set its own episodes and episode length |
 | **Settings** | Episodes per eval, episode length, total timeout (0 = none), device, action-horizon override, submissions per group per 24 h (0 = unlimited), video recording on/off |
 
 | Student page | What a group can do |
@@ -107,10 +119,15 @@ and the usual `train_config.json` / `policy_preprocessor.json` /
 (e.g. `pretrained_model/`). The policy type is read from `config.json`.
 
 **Eval config `.py`:** anything `rollout.py --task=<file.py>` accepts — a
-module that registers an IsaacLab task. Start from the built-in tasks in
-`sim/packages/simulator/src/simulator/tasks/` (e.g. copy
-`cup_stacking/cup_stacking_env_cfg.py`, change the scene, randomisation
-or success condition, and register it under a new gym id).
+module that registers an IsaacLab task. The defaults in `default_tasks/`
+subclass the simulator's env cfg (`sim/packages/simulator/src/simulator/tasks/`)
+and register it under their own gym id; change scene, randomisation or
+success thresholds in their `__post_init__`.
+
+The defaults are copied into the database only on the first start, so UI
+edits and deletions are never overwritten. After a `git pull` that changes
+a file in `default_tasks/`, use **Restore** in the task editor to take the
+new version.
 
 Runs execute one at a time on this worker's GPU, in upload order.
 
@@ -155,7 +172,7 @@ videos are kept in docker volumes and survive the update.
 
 | Volume | Contents | If deleted |
 |---|---|---|
-| `worker_state` | `local.db` (tasks, settings, groups, runs), generated password | Custom tasks, settings, group accounts and history are gone |
+| `worker_state` | `local.db` (tasks, settings, groups, runs), generated admin password, `initial_groups.csv` | Tasks, settings, group accounts and history are gone; the next start re-creates the defaults with new passwords |
 | `worker_storage` | Policy zips, logs, videos (`runs/sid=<id>/`) | Re-run and replay no longer possible |
 | `worker_ov_cache` | Omniverse asset cache | Next eval re-downloads assets (slow) |
 
@@ -174,7 +191,8 @@ videos are kept in docker volumes and survive the update.
 ├── .env.example
 ├── main.py                ← entry point: HTTP server + run queue thread
 ├── server.py              ← FastAPI app (/health + UI router)
-├── local_ui.py            ← UI page + JSON API + login
+├── local_ui.py            ← JSON API, login, first-start defaults
+├── default_tasks/         ← the 3 default eval configs (loaded on first start)
 ├── local_store.py         ← tasks / settings / runs (SQLite)
 ├── local_runner.py        ← run queue → rollout
 ├── rollout.py             ← runs sim/scripts/rollout.py, parses the score
@@ -215,8 +233,10 @@ at a pinned commit (`ISAACLAB_COMMIT` in `Dockerfile.real`).
 | GET | `/api/me/stats` | group: quota left, best score, rank |
 | GET / POST | `/api/runs` (POST = multipart upload), GET `/api/runs/{id}` | any session; groups: own runs only, assigned task, quota, no overrides |
 | GET/PUT | `/api/settings`, GET `/api/settings/defaults` | admin |
-| GET / POST / PUT / DELETE | `/api/users`, `/api/users/{id}` | admin |
+| GET / POST / PUT / DELETE | `/api/users`, `/api/users/{id}` (PUT: `username`, `password`, `assigned_task`) | admin |
 | PUT / DELETE | `/api/tasks/{name}` (GET too) | admin |
+| GET | `/api/default-tasks` | admin: the repo's `default_tasks/` files |
+| GET / DELETE | `/api/initial-credentials` | admin: first-start group passwords still in use |
 | GET | `/api/runs/{id}/log`, `/api/runs/{id}/video` | admin |
 | POST | `/api/runs/{id}/rerun`, `/api/runs/{id}/cancel` | admin |
 | DELETE | `/api/runs/{id}` | admin |

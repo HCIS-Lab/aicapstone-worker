@@ -4,7 +4,7 @@
     <div class="mb-10 flex flex-col md:flex-row md:items-end justify-between gap-6">
       <div>
         <h1 class="text-5xl font-black text-white mb-3 tracking-tight">Tasks</h1>
-        <p class="text-gray-400 text-lg">What a checkpoint is evaluated on: built-in simulator tasks or your own eval configs</p>
+        <p class="text-gray-400 text-lg">What a checkpoint is evaluated on: the default tasks from the repo, edited or not, and your own</p>
       </div>
       <div class="flex items-center gap-4">
         <button @click="fetchTasks"
@@ -26,10 +26,25 @@
             </h3>
             <p class="text-xs text-gray-500 mt-2 max-w-2xl">
               An eval config is a Python file that registers an IsaacLab task — anything
-              <span class="font-mono text-gray-400">rollout.py --task=&lt;file.py&gt;</span> accepts. Start from a
-              built-in task in <span class="font-mono text-gray-400">sim/packages/simulator/src/simulator/tasks/</span>.
+              <span class="font-mono text-gray-400">rollout.py --task=&lt;file.py&gt;</span> accepts. Easiest is to start
+              from a default task (buttons on the right) and change its <span class="font-mono text-gray-400">__post_init__</span>.
               A gym id points at a task that is already registered in the simulator package.
             </p>
+          </div>
+          <div v-if="defaults.length && editor.kind === 'config'" class="flex items-center gap-2 flex-wrap">
+            <span class="text-[10px] font-black text-gray-500 uppercase tracking-widest">
+              {{ editorDefault ? 'Repo version:' : 'Start from:' }}
+            </span>
+            <button v-if="editorDefault" @click="useDefault(editorDefault)"
+                    class="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[10px] font-black text-amber-300 uppercase tracking-widest hover:text-white">
+              Restore {{ editorDefault.name }}.py
+            </button>
+            <template v-else>
+              <button v-for="d in defaults" :key="d.name" @click="useDefault(d)"
+                      class="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[10px] font-black text-gray-300 uppercase tracking-widest hover:text-white">
+                {{ d.name }}.py
+              </button>
+            </template>
           </div>
         </div>
 
@@ -133,8 +148,10 @@
             <div class="flex items-center gap-3 mb-3 flex-wrap">
               <span class="text-sm font-black text-white">{{ taskLabel(t.name) }}</span>
               <span class="text-[10px] font-mono text-gray-500">{{ t.name }}</span>
+              <span v-if="isDefault(t)" class="px-2 py-0.5 rounded-md text-[10px] font-black uppercase bg-white/5 text-gray-400 ml-auto">default</span>
               <span :class="[
-                'px-2 py-0.5 rounded-md text-[10px] font-black uppercase ml-auto',
+                'px-2 py-0.5 rounded-md text-[10px] font-black uppercase',
+                isDefault(t) ? '' : 'ml-auto',
                 t.kind === 'builtin' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-brand-500/20 text-brand-400'
               ]">
                 {{ t.kind === 'builtin' ? 'built-in' : 'eval config' }}
@@ -161,6 +178,13 @@
             </div>
           </div>
         </div>
+        <div v-if="missingDefaults.length" class="mt-5 p-4 rounded-xl bg-white/[0.02] border border-dashed border-white/10 flex items-center gap-3 flex-wrap">
+          <span class="text-xs text-gray-500">Default tasks not in the list:</span>
+          <button v-for="d in missingDefaults" :key="d.name" @click="readdDefault(d)"
+                  class="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[10px] font-black text-brand-300 uppercase tracking-widest hover:text-white">
+            + {{ d.name }}
+          </button>
+        </div>
         <p class="text-[10px] text-gray-600 mt-4">
           <span class="text-amber-300">Amber</span> values are set on the task; grey ones come from Settings.
         </p>
@@ -171,7 +195,9 @@
 
 <script setup>
 import { ref, computed, onMounted, nextTick } from 'vue'
-import { listTasks, getTask, saveTask, deleteTask, getSettings, errorText } from '../api'
+import {
+  listTasks, getTask, saveTask, deleteTask, getSettings, listDefaultTasks, errorText,
+} from '../api'
 import { useUiStore } from '../stores/ui'
 import { formatLocalCompact } from '../utils/datetime'
 import { taskLabel } from '../utils/format'
@@ -184,6 +210,7 @@ const KINDS = [
 const ui = useUiStore()
 
 const tasks = ref([])
+const defaults = ref([])   // the repo's default_tasks/ files
 const settings = ref(null)
 const loading = ref(true)
 
@@ -197,6 +224,30 @@ const contentStats = computed(() => {
   return { lines: c.split('\n').length, kb: (new Blob([c]).size / 1024).toFixed(1) }
 })
 
+const isDefault = (t) => defaults.value.some(d => d.name === t.name)
+const missingDefaults = computed(() =>
+  defaults.value.filter(d => !tasks.value.some(t => t.name === d.name)))
+const editorDefault = computed(() =>
+  editor.value && !editor.value.isNew ? defaults.value.find(d => d.name === editor.value.name) : null)
+
+function useDefault(d) {
+  const e = editor.value
+  e.kind = 'config'
+  e.content = d.content
+  if (!e.description) e.description = d.description
+  if (e.isNew && !e.name) e.name = d.name.startsWith('my_') ? d.name : `my_${d.name}`
+}
+
+async function readdDefault(d) {
+  try {
+    await saveTask(d.name, { content: d.content, description: d.description, overrides: {} })
+    ui.toast(`Task "${d.name}" added from the repo`)
+    fetchTasks()
+  } catch (err) {
+    ui.toast(errorText(err), 'error')
+  }
+}
+
 function effective(t) {
   return {
     eval_rounds: t.overrides?.eval_rounds ?? settings.value?.eval_rounds ?? '…',
@@ -206,9 +257,10 @@ function effective(t) {
 
 async function fetchTasks() {
   try {
-    const [t, s] = await Promise.all([listTasks(), getSettings()])
+    const [t, s, d] = await Promise.all([listTasks(), getSettings(), listDefaultTasks()])
     tasks.value = t.data
     settings.value = s.data
+    defaults.value = d.data
   } catch (err) {
     ui.toast(errorText(err, 'Failed to load tasks'), 'error')
   } finally {
@@ -276,6 +328,10 @@ async function removeTask(t) {
   const ok = await ui.confirm({
     title: `Delete task "${t.name}"?`,
     message: 'Runs already evaluated on it keep their results. Queued runs for this task will fail.',
+    bullets: [
+      'Groups assigned to it can no longer submit until you assign them another task.',
+      ...(isDefault(t) ? ['It is a default task: you can add it back from the repo version later.'] : []),
+    ],
     danger: true,
     acceptLabel: 'Delete',
   })
