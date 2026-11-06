@@ -22,7 +22,7 @@ from worker_agent.config import cfg
 DEFAULT_SETTINGS: dict[str, Any] = {
     "eval_rounds": 50,
     "episode_length_s": 60,
-    "timeout_sec": 10800,      # 0 = no total-time limit
+    "timeout_sec": 18000,      # 0 = no total-time limit
     "device": "cuda:0",
     "record_video": True,
     "action_horizon": None,    # None = from the checkpoint / per-policy default
